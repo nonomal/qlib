@@ -4,6 +4,7 @@
 """
 This example shows how a TrainerRM works based on TaskManager with rolling tasks.
 After training, how to collect the rolling results will be shown in task_collecting.
+Based on the ability of TaskManager, `worker` method offer a simple way for multiprocessing.
 """
 
 from pprint import pprint
@@ -13,67 +14,11 @@ import qlib
 from qlib.config import REG_CN
 from qlib.workflow import R
 from qlib.workflow.task.gen import RollingGen, task_generator
-from qlib.workflow.task.manage import TaskManager
+from qlib.workflow.task.manage import TaskManager, run_task
 from qlib.workflow.task.collect import RecorderCollector
 from qlib.model.ens.group import RollingGroup
 from qlib.model.trainer import TrainerRM
-
-
-data_handler_config = {
-    "start_time": "2008-01-01",
-    "end_time": "2020-08-01",
-    "fit_start_time": "2008-01-01",
-    "fit_end_time": "2014-12-31",
-    "instruments": "csi100",
-}
-
-dataset_config = {
-    "class": "DatasetH",
-    "module_path": "qlib.data.dataset",
-    "kwargs": {
-        "handler": {
-            "class": "Alpha158",
-            "module_path": "qlib.contrib.data.handler",
-            "kwargs": data_handler_config,
-        },
-        "segments": {
-            "train": ("2008-01-01", "2014-12-31"),
-            "valid": ("2015-01-01", "2016-12-31"),
-            "test": ("2017-01-01", "2020-08-01"),
-        },
-    },
-}
-
-record_config = [
-    {
-        "class": "SignalRecord",
-        "module_path": "qlib.workflow.record_temp",
-    },
-    {
-        "class": "SigAnaRecord",
-        "module_path": "qlib.workflow.record_temp",
-    },
-]
-
-# use lgb
-task_lgb_config = {
-    "model": {
-        "class": "LGBModel",
-        "module_path": "qlib.contrib.model.gbdt",
-    },
-    "dataset": dataset_config,
-    "record": record_config,
-}
-
-# use xgboost
-task_xgboost_config = {
-    "model": {
-        "class": "XGBModel",
-        "module_path": "qlib.contrib.model.xgboost",
-    },
-    "dataset": dataset_config,
-    "record": record_config,
-}
+from qlib.tests.config import CSI100_RECORD_LGB_TASK_CONFIG, CSI100_RECORD_XGBOOST_TASK_CONFIG
 
 
 class RollingTaskExample:
@@ -85,11 +30,13 @@ class RollingTaskExample:
         task_db_name="rolling_db",
         experiment_name="rolling_exp",
         task_pool="rolling_task",
-        task_config=[task_xgboost_config, task_lgb_config],
+        task_config=None,
         rolling_step=550,
         rolling_type=RollingGen.ROLL_SD,
     ):
         # TaskManager config
+        if task_config is None:
+            task_config = [CSI100_RECORD_XGBOOST_TASK_CONFIG, CSI100_RECORD_LGB_TASK_CONFIG]
         mongo_conf = {
             "task_url": task_url,
             "task_db_name": task_db_name,
@@ -121,6 +68,11 @@ class RollingTaskExample:
         print("========== task_training ==========")
         trainer = TrainerRM(self.experiment_name, self.task_pool)
         trainer.train(tasks)
+
+    def worker(self):
+        # train tasks by other progress or machines for multiprocessing. It is same as TrainerRM.worker.
+        print("========== worker ==========")
+        run_task(task_train, self.task_pool, experiment_name=self.experiment_name)
 
     def task_collecting(self):
         print("========== task_collecting ==========")

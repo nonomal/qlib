@@ -67,16 +67,51 @@ After running the above command, users can find china-stock and us-stock data in
 
 When ``Qlib`` is initialized with this dataset, users could build and evaluate their own models with it.  Please refer to `Initialization <../start/initialization.html>`_ for more details.
 
+Automatic update of daily frequency data
+----------------------------------------
+
+  **It is recommended that users update the data manually once (\-\-trading_date 2021-05-25) and then set it to update automatically.**
+
+  For more information refer to: `yahoo collector <https://github.com/microsoft/qlib/tree/main/scripts/data_collector/yahoo#Automatic-update-of-daily-frequency-data>`_
+
+  - Automatic update of data to the "qlib" directory each trading day(Linux)
+      - use *crontab*: `crontab -e`
+      - set up timed tasks:
+
+        .. code-block:: bash
+
+            * * * * 1-5 python <script path> update_data_to_bin --qlib_data_1d_dir <user data dir>
+
+        - **script path**: *scripts/data_collector/yahoo/collector.py*
+
+  - Manual update of data
+
+      .. code-block:: bash
+
+        python scripts/data_collector/yahoo/collector.py update_data_to_bin --qlib_data_1d_dir <user data dir> --trading_date <start date> --end_date <end date>
+
+      - *trading_date*: start of trading day
+      - *end_date*: end of trading day(not included)
+
+
+
 Converting CSV Format into Qlib Format
 -------------------------------------------
 
 ``Qlib`` has provided the script ``scripts/dump_bin.py`` to convert **any** data in CSV format into `.bin` files (``Qlib`` format) as long as they are in the correct format.
 
-Users can download the demo china-stock data in CSV format as follows for reference to the CSV format.
+Besides downloading the prepared demo data, users could download demo data directly from the Collector as follows for reference to the CSV format.
+Here are some example:
 
-.. code-block:: bash
+for daily data:
+  .. code-block:: bash
 
     python scripts/get_data.py csv_data_cn --target_dir ~/.qlib/csv_data/cn_data
+
+for 1min data:
+  .. code-block:: bash
+
+    python scripts/data_collector/yahoo/collector.py download_data --source_dir ~/.qlib/stock_data/source/cn_1min --region CN --start 2021-05-20 --end 2021-05-23 --delay 0.1 --interval 1min --limit_nums 10
 
 Users can also provide their own data in CSV format. However, the CSV data **must satisfies** following criterions:
 
@@ -144,6 +179,16 @@ After conversion, users can find their Qlib format data in the directory `~/.qli
         The Restoration factor. Normally, ``factor = adjusted_price / original_price``, `adjusted price` reference: `split adjusted <https://www.investopedia.com/terms/s/splitadjusted.asp>`_
 
     In the convention of `Qlib` data processing, `open, close, high, low, volume, money and factor` will be set to NaN if the stock is suspended. 
+
+Stock Pool (Market)
+--------------------------------
+
+``Qlib`` defines `stock pool <https://github.com/microsoft/qlib/blob/main/examples/benchmarks/LightGBM/workflow_config_lightgbm_Alpha158.yaml#L4>`_ as stock list and their date ranges. Predefined stock pools (e.g. csi300) may be imported as follows.
+
+.. code-block:: bash
+
+    python collector.py --index_name CSI300 --qlib_dir <user qlib data dir> --method parse_instruments
+
 
 Multiple Stock Modes
 --------------------------------
