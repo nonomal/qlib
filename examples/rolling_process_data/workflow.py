@@ -3,19 +3,16 @@
 
 import qlib
 import fire
-import pickle
-import pandas as pd
 
 from datetime import datetime
-from qlib.config import REG_CN
+from qlib.constant import REG_CN
 from qlib.data.dataset.handler import DataHandlerLP
-from qlib.contrib.data.handler import Alpha158
-from qlib.utils import exists_qlib_data, init_instance_by_config
+from qlib.utils import init_instance_by_config
+from qlib.utils.pickle_utils import restricted_pickle_load
 from qlib.tests.data import GetData
 
 
 class RollingDataWorkflow:
-
     MARKET = "csi300"
     start_time = "2010-01-01"
     end_time = "2019-12-31"
@@ -23,11 +20,8 @@ class RollingDataWorkflow:
 
     def _init_qlib(self):
         """initialize qlib"""
-        # use yahoo_cn_1min data
         provider_uri = "~/.qlib/qlib_data/cn_data"  # target_dir
-        if not exists_qlib_data(provider_uri):
-            print(f"Qlib data is not found in {provider_uri}")
-            GetData().qlib_data(target_dir=provider_uri, region=REG_CN)
+        GetData().qlib_data(target_dir=provider_uri, region=REG_CN, exists_skip=True)
         qlib.init(provider_uri=provider_uri, region=REG_CN)
 
     def _dump_pre_handler(self, path):
@@ -48,7 +42,7 @@ class RollingDataWorkflow:
 
     def _load_pre_handler(self, path):
         with open(path, "rb") as file_dataset:
-            pre_handler = pickle.load(file_dataset)
+            pre_handler = restricted_pickle_load(file_dataset)
         return pre_handler
 
     def rolling_process(self):
@@ -98,7 +92,6 @@ class RollingDataWorkflow:
         dataset = init_instance_by_config(dataset_config)
 
         for rolling_offset in range(self.rolling_cnt):
-
             print(f"===========rolling{rolling_offset} start===========")
             if rolling_offset:
                 dataset.config(

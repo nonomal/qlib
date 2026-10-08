@@ -1,17 +1,17 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-import os
-import pickle
-import yaml
+# pylint: skip-file
+# flake8: noqa
+
 import pathlib
 import pandas as pd
 import shutil
-from ..backtest.account import Account
-from ..backtest.exchange import Exchange
+from ruamel.yaml import YAML
+from ...backtest.account import Account
 from .user import User
-from .utils import load_instance
-from ...utils import save_instance, init_instance_by_config
+from .utils import load_instance, save_instance
+from ...utils import init_instance_by_config
 
 
 class UserManager:
@@ -110,7 +110,8 @@ class UserManager:
             raise ValueError("User data for {} already exists".format(user_id))
 
         with config_file.open("r") as fp:
-            config = yaml.safe_load(fp)
+            yaml = YAML(typ="safe", pure=True)
+            config = yaml.load(fp)
         # load model
         model = init_instance_by_config(config["model"])
 

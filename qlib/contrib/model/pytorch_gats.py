@@ -5,7 +5,6 @@
 from __future__ import division
 from __future__ import print_function
 
-import os
 import numpy as np
 import pandas as pd
 from typing import Text, Union
@@ -34,7 +33,7 @@ class GATs(Model):
     d_feat : int
         input dimensions for each time step
     metric : str
-        the evaluate metric used in early stop
+        the evaluation metric used in early stop
     optimizer : str
         optimizer name
     GPU : int
@@ -53,12 +52,11 @@ class GATs(Model):
         early_stop=20,
         loss="mse",
         base_model="GRU",
-        with_pretrain=True,
         model_path=None,
         optimizer="adam",
         GPU=0,
         seed=None,
-        **kwargs
+        **kwargs,
     ):
         # Set logger.
         self.logger = get_module_logger("GATs")
@@ -76,7 +74,6 @@ class GATs(Model):
         self.optimizer = optimizer.lower()
         self.loss = loss
         self.base_model = base_model
-        self.with_pretrain = with_pretrain
         self.model_path = model_path
         self.device = torch.device("cuda:%d" % (GPU) if torch.cuda.is_available() and GPU >= 0 else "cpu")
         self.seed = seed
@@ -94,7 +91,6 @@ class GATs(Model):
             "\noptimizer : {}"
             "\nloss_type : {}"
             "\nbase_model : {}"
-            "\nwith_pretrain : {}"
             "\nmodel_path : {}"
             "\ndevice : {}"
             "\nuse_GPU : {}"
@@ -110,7 +106,6 @@ class GATs(Model):
                 optimizer.lower(),
                 loss,
                 base_model,
-                with_pretrain,
                 model_path,
                 self.device,
                 self.use_gpu,
@@ -159,17 +154,16 @@ class GATs(Model):
         raise ValueError("unknown loss `%s`" % self.loss)
 
     def metric_fn(self, pred, label):
-
         mask = torch.isfinite(label)
 
-        if self.metric == "" or self.metric == "loss":
+        if self.metric in ("", "loss"):
             return -self.loss_fn(pred[mask], label[mask])
 
         raise ValueError("unknown metric `%s`" % self.metric)
 
     def get_daily_inter(self, df, shuffle=False):
         # organize the train data into daily batches
-        daily_count = df.groupby(level=0).size().values
+        daily_count = df.groupby(level=0, group_keys=False).size().values
         daily_index = np.roll(np.cumsum(daily_count), 1)
         daily_index[0] = 0
         if shuffle:
@@ -180,7 +174,6 @@ class GATs(Model):
         return daily_index, daily_count
 
     def train_epoch(self, x_train, y_train):
-
         x_train_values = x_train.values
         y_train_values = np.squeeze(y_train.values)
         self.GAT_model.train()
@@ -202,7 +195,6 @@ class GATs(Model):
             self.train_optimizer.step()
 
     def test_epoch(self, data_x, data_y):
-
         # prepare training data
         x_values = data_x.values
         y_values = np.squeeze(data_y.values)
@@ -235,12 +227,13 @@ class GATs(Model):
         evals_result=dict(),
         save_path=None,
     ):
-
         df_train, df_valid, df_test = dataset.prepare(
             ["train", "valid", "test"],
             col_set=["feature", "label"],
             data_key=DataHandlerLP.DK_L,
         )
+        if df_train.empty or df_valid.empty:
+            raise ValueError("Empty data from dataset, please check your dataset config.")
 
         x_train, y_train = df_train["feature"], df_train["label"]
         x_valid, y_valid = df_valid["feature"], df_valid["label"]
@@ -253,24 +246,24 @@ class GATs(Model):
         evals_result["valid"] = []
 
         # load pretrained base_model
-        if self.with_pretrain:
-            if self.model_path == None:
-                raise ValueError("the path of the pretrained model should be given first!")
-            self.logger.info("Loading pretrained model...")
-            if self.base_model == "LSTM":
-                pretrained_model = LSTMModel()
-                pretrained_model.load_state_dict(torch.load(self.model_path))
-            elif self.base_model == "GRU":
-                pretrained_model = GRUModel()
-                pretrained_model.load_state_dict(torch.load(self.model_path))
-            else:
-                raise ValueError("unknown base model name `%s`" % self.base_model)
+        if self.base_model == "LSTM":
+            pretrained_model = LSTMModel()
+        elif self.base_model == "GRU":
+            pretrained_model = GRUModel()
+        else:
+            raise ValueError("unknown base model name `%s`" % self.base_model)
 
-            model_dict = self.GAT_model.state_dict()
-            pretrained_dict = {k: v for k, v in pretrained_model.state_dict().items() if k in model_dict}
-            model_dict.update(pretrained_dict)
-            self.GAT_model.load_state_dict(model_dict)
-            self.logger.info("Loading pretrained model Done...")
+        if self.model_path is not None:
+            self.logger.info("Loading pretrained model...")
+            pretrained_model.load_state_dict(torch.load(self.model_path, map_location=self.device))
+
+        model_dict = self.GAT_model.state_dict()
+        pretrained_dict = {
+            k: v for k, v in pretrained_model.state_dict().items() if k in model_dict  # pylint: disable=E1135
+        }
+        model_dict.update(pretrained_dict)
+        self.GAT_model.load_state_dict(model_dict)
+        self.logger.info("Loading pretrained model Done...")
 
         # train
         self.logger.info("training...")

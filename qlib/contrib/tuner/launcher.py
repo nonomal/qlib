@@ -1,6 +1,9 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+# pylint: skip-file
+# flake8: noqa
+
 # coding=utf-8
 
 import argparse
@@ -9,7 +12,6 @@ import os
 import yaml
 
 from .config import TunerConfigManager
-
 
 args_parser = argparse.ArgumentParser(prog="tuner")
 args_parser.add_argument(

@@ -1,11 +1,13 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+# pylint: skip-file
+# flake8: noqa
+
 import os
 import yaml
 import json
 import copy
-import pickle
 import logging
 import importlib
 import subprocess
@@ -15,13 +17,13 @@ import numpy as np
 from abc import abstractmethod
 
 from ...log import get_module_logger, TimeInspector
+from ...utils.pickle_utils import restricted_pickle_load
 from hyperopt import fmin, tpe
 from hyperopt import STATUS_OK, STATUS_FAIL
 
 
 class Tuner:
     def __init__(self, tuner_config, optim_config):
-
         self.logger = get_module_logger("Tuner", sh_level=logging.INFO)
 
         self.tuner_config = tuner_config
@@ -39,13 +41,13 @@ class Tuner:
         self.space = self.setup_space()
 
     def tune(self):
-
         TimeInspector.set_time_mark()
         fmin(
             fn=self.objective,
             space=self.space,
             algo=tpe.suggest,
             max_evals=self.max_evals,
+            show_progressbar=False,
         )
         self.logger.info("Local best params: {} ".format(self.best_params))
         TimeInspector.log_cost_time(
@@ -80,7 +82,6 @@ class Tuner:
 
 
 class QLibTuner(Tuner):
-
     ESTIMATOR_CONFIG_NAME = "estimator_config.yaml"
     EXP_INFO_NAME = "exp_info.json"
     EXP_RESULT_DIR = "sacred/{}"
@@ -88,8 +89,7 @@ class QLibTuner(Tuner):
     LOCAL_BEST_PARAMS_NAME = "local_best_params.json"
 
     def objective(self, params):
-
-        # 1. Setup an config for a spcific estimator process
+        # 1. Setup an config for a specific estimator process
         estimator_path = self.setup_estimator_config(params)
         self.logger.info("Searching params: {} ".format(params))
 
@@ -116,7 +116,6 @@ class QLibTuner(Tuner):
         return {"loss": res, "status": status}
 
     def fetch_result(self):
-
         # 1. Get experiment information
         exp_info_path = os.path.join(self.ex_dir, QLibTuner.EXP_INFO_NAME)
         with open(exp_info_path) as fp:
@@ -137,7 +136,7 @@ class QLibTuner(Tuner):
         exp_result_dir = os.path.join(self.ex_dir, QLibTuner.EXP_RESULT_DIR.format(estimator_ex_id))
         exp_result_path = os.path.join(exp_result_dir, QLibTuner.EXP_RESULT_NAME)
         with open(exp_result_path, "rb") as fp:
-            analysis_df = pickle.load(fp)
+            analysis_df = restricted_pickle_load(fp)
 
         # 4. Get the backtest factor which user want to optimize, if user want to maximize the factor, then reverse the result
         res = analysis_df.loc[self.optim_config.report_type].loc[self.optim_config.report_factor]
@@ -151,7 +150,6 @@ class QLibTuner(Tuner):
             return np.abs(res.values[0] - 1)
 
     def setup_estimator_config(self, params):
-
         estimator_config = copy.deepcopy(self.tuner_config)
         estimator_config["model"].update({"args": params["model_space"]})
         estimator_config["strategy"].update({"args": params["strategy_space"]})
@@ -208,7 +206,6 @@ class QLibTuner(Tuner):
         return space
 
     def save_local_best_params(self):
-
         TimeInspector.set_time_mark()
         local_best_params_path = os.path.join(self.ex_dir, QLibTuner.LOCAL_BEST_PARAMS_NAME)
         with open(local_best_params_path, "w") as fp:

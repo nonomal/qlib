@@ -1,20 +1,23 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-import yaml
+# pylint: skip-file
+# flake8: noqa
+
 import copy
 import os
+from ruamel.yaml import YAML
 
 
 class TunerConfigManager:
     def __init__(self, config_path):
-
         if not config_path:
             raise ValueError("Config path is invalid.")
         self.config_path = config_path
 
         with open(config_path) as fp:
-            config = yaml.safe_load(fp)
+            yaml = YAML(typ="safe", pure=True)
+            config = yaml.load(fp)
         self.config = copy.deepcopy(config)
 
         self.pipeline_ex_config = PipelineExperimentConfig(config.get("experiment", dict()), self)
@@ -47,15 +50,16 @@ class PipelineExperimentConfig:
         # Get the tuner type
         self.tuner_module_path = config.get("tuner_module_path", "qlib.contrib.tuner.tuner")
         self.tuner_class = config.get("tuner_class", "QLibTuner")
+        self.trusted = config.get("trusted", False)
         # Save the tuner experiment for further view
         tuner_ex_config_path = os.path.join(self.tuner_ex_dir, "tuner_config.yaml")
         with open(tuner_ex_config_path, "w") as fp:
+            yaml = YAML(typ="safe", pure=True)
             yaml.dump(TUNER_CONFIG_MANAGER.config, fp)
 
 
 class OptimizationConfig:
     def __init__(self, config, TUNER_CONFIG_MANAGER):
-
         self.report_type = config.get("report_type", "pred_long")
         if self.report_type not in [
             "pred_long",

@@ -38,7 +38,7 @@ def _get_cum_return_data_with_position(
 
     _cumulative_return_df["label"] = _cumulative_return_df["label"] - _cumulative_return_df["bench"]
     _cumulative_return_df = _cumulative_return_df.dropna()
-    df_gp = _cumulative_return_df.groupby(level="datetime")
+    df_gp = _cumulative_return_df.groupby(level="datetime", group_keys=False)
     result_list = []
     for gp in df_gp:
         date = gp[0]
@@ -218,6 +218,7 @@ def cumulative_return_graph(
 
 
         Graph desc:
+
             - Axis X: Trading day.
             - Axis Y:
             - Above axis Y: `(((Ref($close, -1)/$close - 1) * weight).sum() / weight.sum()).cumsum()`.
@@ -242,7 +243,8 @@ def cumulative_return_graph(
 
 
     :param label_data: `D.features` result; index is `pd.MultiIndex`, index name is [`instrument`, `datetime`]; columns names is [`label`].
-    **The label T is the change from T to T+1**, it is recommended to use ``close``, example: `D.features(D.instruments('csi500'), ['Ref($close, -1)/$close-1'])`
+
+        **The label T is the change from T to T+1**, it is recommended to use ``close``, example: `D.features(D.instruments('csi500'), ['Ref($close, -1)/$close-1'])`
 
 
             .. code-block:: python

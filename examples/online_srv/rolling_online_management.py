@@ -13,79 +13,36 @@ Finally, the OnlineManager will finish second routine and update all strategies.
 import os
 import fire
 import qlib
+from qlib.model.trainer import DelayTrainerR, DelayTrainerRM, TrainerR, TrainerRM, end_task_train, task_train
+from qlib.utils.pickle_utils import validate_trusted
 from qlib.workflow import R
 from qlib.workflow.online.strategy import RollingStrategy
 from qlib.workflow.task.gen import RollingGen
 from qlib.workflow.online.manager import OnlineManager
-
-data_handler_config = {
-    "start_time": "2013-01-01",
-    "end_time": "2020-09-25",
-    "fit_start_time": "2013-01-01",
-    "fit_end_time": "2014-12-31",
-    "instruments": "csi100",
-}
-
-dataset_config = {
-    "class": "DatasetH",
-    "module_path": "qlib.data.dataset",
-    "kwargs": {
-        "handler": {
-            "class": "Alpha158",
-            "module_path": "qlib.contrib.data.handler",
-            "kwargs": data_handler_config,
-        },
-        "segments": {
-            "train": ("2013-01-01", "2014-12-31"),
-            "valid": ("2015-01-01", "2015-12-31"),
-            "test": ("2016-01-01", "2020-07-10"),
-        },
-    },
-}
-
-record_config = [
-    {
-        "class": "SignalRecord",
-        "module_path": "qlib.workflow.record_temp",
-    },
-    {
-        "class": "SigAnaRecord",
-        "module_path": "qlib.workflow.record_temp",
-    },
-]
-
-# use lgb model
-task_lgb_config = {
-    "model": {
-        "class": "LGBModel",
-        "module_path": "qlib.contrib.model.gbdt",
-    },
-    "dataset": dataset_config,
-    "record": record_config,
-}
-
-# use xgboost model
-task_xgboost_config = {
-    "model": {
-        "class": "XGBModel",
-        "module_path": "qlib.contrib.model.xgboost",
-    },
-    "dataset": dataset_config,
-    "record": record_config,
-}
+from qlib.tests.config import CSI100_RECORD_XGBOOST_TASK_CONFIG_ROLLING, CSI100_RECORD_LGB_TASK_CONFIG_ROLLING
+from qlib.workflow.task.manage import TaskManager
 
 
 class RollingOnlineExample:
+    trusted = False
+
     def __init__(
         self,
         provider_uri="~/.qlib/qlib_data/cn_data",
         region="cn",
-        task_url="mongodb://10.0.0.4:27017/",
-        task_db_name="rolling_db",
+        trainer=None,  # defaults to DelayTrainerRM; a supplied trainer keeps its own trust policy
+        task_url="mongodb://10.0.0.4:27017/",  # not necessary when using TrainerR or DelayTrainerR
+        task_db_name="rolling_db",  # not necessary when using TrainerR or DelayTrainerR
         rolling_step=550,
-        tasks=[task_xgboost_config],
-        add_tasks=[task_lgb_config],
+        tasks=None,
+        add_tasks=None,
+        *,
+        trusted=False,
     ):
+        if add_tasks is None:
+            add_tasks = [CSI100_RECORD_LGB_TASK_CONFIG_ROLLING]
+        if tasks is None:
+            tasks = [CSI100_RECORD_XGBOOST_TASK_CONFIG_ROLLING]
         mongo_conf = {
             "task_url": task_url,  # your MongoDB url
             "task_db_name": task_db_name,  # database name
@@ -94,6 +51,7 @@ class RollingOnlineExample:
         self.tasks = tasks
         self.add_tasks = add_tasks
         self.rolling_step = rolling_step
+        self.trusted = validate_trusted(trusted)
         strategies = []
         for task in tasks:
             name_id = task["model"]["class"]  # NOTE: Assumption: The model class can specify only one strategy
@@ -102,19 +60,31 @@ class RollingOnlineExample:
                     name_id,
                     task,
                     RollingGen(step=rolling_step, rtype=RollingGen.ROLL_SD),
+                    trusted=self.trusted,
                 )
             )
-
-        self.rolling_online_manager = OnlineManager(strategies)
+        self.trainer = DelayTrainerRM(trusted=trusted) if trainer is None else trainer
+        self.rolling_online_manager = OnlineManager(strategies, trainer=self.trainer)
 
     _ROLLING_MANAGER_PATH = (
         ".RollingOnlineExample"  # the OnlineManager will dump to this file, for it can be loaded when calling routine.
     )
 
+    def worker(self):
+        # train tasks by other progress or machines for multiprocessing
+        print("========== worker ==========")
+        if isinstance(self.trainer, TrainerRM):
+            for task in self.tasks + self.add_tasks:
+                name_id = task["model"]["class"]
+                self.trainer.worker(experiment_name=name_id)
+        else:
+            print(f"{type(self.trainer)} is not supported for worker.")
+
     # Reset all things to the first status, be careful to save important data
     def reset(self):
         for task in self.tasks + self.add_tasks:
             name_id = task["model"]["class"]
+            TaskManager(task_pool=name_id).remove()
             exp = R.get_exp(experiment_name=name_id)
             for rid in exp.list_recorders():
                 exp.delete_recorder(rid)
@@ -156,6 +126,7 @@ class RollingOnlineExample:
                     name_id,
                     task,
                     RollingGen(step=self.rolling_step, rtype=RollingGen.ROLL_SD),
+                    trusted=self.trusted,
                 )
             )
         self.rolling_online_manager.add_strategy(strategies=strategies)
@@ -171,11 +142,16 @@ class RollingOnlineExample:
 
 if __name__ == "__main__":
     ####### to train the first version's models, use the command below
-    # python rolling_online_management.py first_run
+    # Only opt in for artifacts whose writer and store you trust. first_run resets the experiments.
+    # python rolling_online_management.py --trusted=True first_run
 
     ####### to update the models and predictions after the trading time, use the command below
+    # The saved manager is a separately trusted local pickle and retains its original trust settings.
     # python rolling_online_management.py routine
 
+    ####### to give newly added strategies the same explicit consent
+    # python rolling_online_management.py --trusted=True add_strategy
+
     ####### to define your own parameters, use `--`
-    # python rolling_online_management.py first_run --exp_name='your_exp_name' --rolling_step=40
+    # python rolling_online_management.py --trusted=True --rolling_step=40 first_run
     fire.Fire(RollingOnlineExample)

@@ -5,30 +5,7 @@ from qlib.data.ops import ElemOperator, PairOperator
 from qlib.config import C
 from qlib.data.cache import H
 from qlib.data.data import Cal
-
-
-def get_calendar_day(freq="day", future=False):
-    """Load High-Freq Calendar Date Using Memcache.
-
-    Parameters
-    ----------
-    freq : str
-        frequency of read calendar file.
-    future : bool
-        whether including future trading day.
-
-    Returns
-    -------
-    _calendar:
-        array of date.
-    """
-    flag = f"{freq}_future_{future}_day"
-    if flag in H["c"]:
-        _calendar = H["c"][flag]
-    else:
-        _calendar = np.array(list(map(lambda x: x.date(), Cal.load_calendar(freq, future))))
-        H["c"][flag] = _calendar
-    return _calendar
+from qlib.contrib.ops.high_freq import get_calendar_day
 
 
 class DayLast(ElemOperator):
@@ -48,7 +25,7 @@ class DayLast(ElemOperator):
     def _load_internal(self, instrument, start_index, end_index, freq):
         _calendar = get_calendar_day(freq=freq)
         series = self.feature.load(instrument, start_index, end_index, freq)
-        return series.groupby(_calendar[series.index]).transform("last")
+        return series.groupby(_calendar[series.index], group_keys=False).transform("last")
 
 
 class FFillNan(ElemOperator):
@@ -67,7 +44,7 @@ class FFillNan(ElemOperator):
 
     def _load_internal(self, instrument, start_index, end_index, freq):
         series = self.feature.load(instrument, start_index, end_index, freq)
-        return series.fillna(method="ffill")
+        return series.ffill()
 
 
 class BFillNan(ElemOperator):
@@ -86,7 +63,7 @@ class BFillNan(ElemOperator):
 
     def _load_internal(self, instrument, start_index, end_index, freq):
         series = self.feature.load(instrument, start_index, end_index, freq)
-        return series.fillna(method="bfill")
+        return series.bfill()
 
 
 class Date(ElemOperator):
@@ -173,7 +150,7 @@ class Cut(ElemOperator):
         self.l = l
         self.r = r
         if (self.l is not None and self.l <= 0) or (self.r is not None and self.r >= 0):
-            raise ValueError("Cut operator l shoud > 0 and r should < 0")
+            raise ValueError("Cut operator l should > 0 and r should < 0")
 
         super(Cut, self).__init__(feature)
 

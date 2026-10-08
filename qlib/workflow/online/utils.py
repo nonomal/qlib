@@ -10,6 +10,8 @@ This allows us to use efficient submodels as the market-style changing.
 from typing import List, Union
 
 from qlib.log import get_module_logger
+from qlib.utils.exceptions import LoadObjectError
+from qlib.utils.pickle_utils import validate_trusted
 from qlib.workflow.online.update import PredUpdater
 from qlib.workflow.recorder import Recorder
 from qlib.workflow.task.utils import list_recorders
@@ -88,15 +90,20 @@ class OnlineToolR(OnlineTool):
     The implementation of OnlineTool based on (R)ecorder.
     """
 
-    def __init__(self, experiment_name: str):
+    trusted = False
+
+    def __init__(self, default_exp_name: str = None, *, trusted: bool = False):
         """
         Init OnlineToolR.
 
         Args:
-            experiment_name (str): the experiment name.
+            default_exp_name (str): the default experiment name.
+            trusted (bool): explicitly allow model/dataset pickle loading
+                from trusted sources and storage when updating predictions.
         """
         super().__init__()
-        self.exp_name = experiment_name
+        self.default_exp_name = default_exp_name
+        self.trusted = validate_trusted(trusted)
 
     def set_online_tag(self, tag, recorder: Union[Recorder, List]):
         """
@@ -125,44 +132,62 @@ class OnlineToolR(OnlineTool):
         tags = recorder.list_tags()
         return tags.get(self.ONLINE_KEY, self.OFFLINE_TAG)
 
-    def reset_online_tag(self, recorder: Union[Recorder, List]):
+    def reset_online_tag(self, recorder: Union[Recorder, List], exp_name: str = None):
         """
         Offline all models and set the recorders to 'online'.
 
         Args:
             recorder (Union[Recorder, List]):
                 the recorder you want to reset to 'online'.
+            exp_name (str): the experiment name. If None, then use default_exp_name.
 
         """
+        exp_name = self._get_exp_name(exp_name)
         if isinstance(recorder, Recorder):
             recorder = [recorder]
-        recs = list_recorders(self.exp_name)
+        recs = list_recorders(exp_name)
         self.set_online_tag(self.OFFLINE_TAG, list(recs.values()))
         self.set_online_tag(self.ONLINE_TAG, recorder)
 
-    def online_models(self) -> list:
+    def online_models(self, exp_name: str = None) -> list:
         """
         Get current `online` models
+
+        Args:
+            exp_name (str): the experiment name. If None, then use default_exp_name.
 
         Returns:
             list: a list of `online` models.
         """
-        return list(list_recorders(self.exp_name, lambda rec: self.get_online_tag(rec) == self.ONLINE_TAG).values())
+        exp_name = self._get_exp_name(exp_name)
+        return list(list_recorders(exp_name, lambda rec: self.get_online_tag(rec) == self.ONLINE_TAG).values())
 
-    def update_online_pred(self, to_date=None):
+    def update_online_pred(self, to_date=None, from_date=None, exp_name: str = None):
         """
         Update the predictions of online models to to_date.
 
         Args:
             to_date (pd.Timestamp): the pred before this date will be updated. None for updating to latest time in Calendar.
+            exp_name (str): the experiment name. If None, then use default_exp_name.
         """
-        online_models = self.online_models()
+        exp_name = self._get_exp_name(exp_name)
+        online_models = self.online_models(exp_name=exp_name)
         for rec in online_models:
-            hist_ref = 0
-            task = rec.load_object("task")
-            # Special treatment of historical dependencies
-            if task["dataset"]["class"] == "TSDatasetH":
-                hist_ref = task["dataset"]["kwargs"]["step_len"]
-            PredUpdater(rec, to_date=to_date, hist_ref=hist_ref).update()
+            try:
+                updater = PredUpdater(rec, to_date=to_date, from_date=from_date, trusted=self.trusted)
+            except LoadObjectError as e:
+                # skip the recorder without pred
+                self.logger.warn(f"An exception `{str(e)}` happened when load `pred.pkl`, skip it.")
+                continue
+            updater.update()
 
-        self.logger.info(f"Finished updating {len(online_models)} online model predictions of {self.exp_name}.")
+        self.logger.info(f"Finished updating {len(online_models)} online model predictions of {exp_name}.")
+
+    def _get_exp_name(self, exp_name):
+        if exp_name is None:
+            if self.default_exp_name is None:
+                raise ValueError(
+                    "Both default_exp_name and exp_name are None. OnlineToolR needs a specific experiment."
+                )
+            exp_name = self.default_exp_name
+        return exp_name

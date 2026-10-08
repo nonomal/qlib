@@ -1,14 +1,34 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-import mlflow, logging
-import shutil, os, pickle, tempfile, codecs, pickle
+import os
+import sys
+from typing import Optional
+import mlflow
+import shutil
+import pickle
+import warnings
+import tempfile
+import subprocess
+import platform
 from pathlib import Path
 from datetime import datetime
-from ..utils.objm import FileManager
-from ..log import get_module_logger
 
-logger = get_module_logger("workflow", logging.INFO)
+from qlib.utils.serial import Serializable
+from qlib.utils.exceptions import LoadObjectError
+from qlib.utils.paral import AsyncCaller
+from qlib.utils.pickle_utils import ARTIFACT_MIGRATION_URL, RestrictedUnpickler, validate_trusted
+
+from ..log import TimeInspector, get_module_logger
+from mlflow.store.artifact.azure_blob_artifact_repo import AzureBlobArtifactRepository
+
+logger = get_module_logger("workflow")
+# mlflow limits the length of log_param to 500, but this caused errors when using qrun, so we extended the mlflow limit.
+mlflow.utils.validation.MAX_PARAM_VAL_LENGTH = 1000
+
+
+class UnsafeArtifactWarning(UserWarning):
+    """Warning emitted when an artifact is loaded with unrestricted pickle."""
 
 
 class Recorder:
@@ -62,6 +82,8 @@ class Recorder:
         Save objects such as prediction file or model checkpoints to the artifact URI. User
         can save object through keywords arguments (name:value).
 
+        Please refer to the docs of qlib.workflow:R.save_objects
+
         Parameters
         ----------
         local_path : str
@@ -71,7 +93,7 @@ class Recorder:
         """
         raise NotImplementedError(f"Please implement the `save_objects` method.")
 
-    def load_object(self, name):
+    def load_object(self, name, *, trusted=False):
         """
         Load objects such as prediction file or model checkpoints.
 
@@ -79,6 +101,10 @@ class Recorder:
         ----------
         name : str
             name of the file to be loaded.
+        trusted : bool
+            Whether to allow unrestricted pickle loading. Defaults to False.
+            Implementations must not silently retry restricted loads with an
+            unrestricted loader. Only enable this for trusted sources and storage.
 
         Returns
         -------
@@ -125,6 +151,19 @@ class Recorder:
         """
         raise NotImplementedError(f"Please implement the `log_metrics` method.")
 
+    def log_artifact(self, local_path: str, artifact_path: Optional[str] = None):
+        """
+        Log a local file or directory as an artifact of the currently active run.
+
+        Parameters
+        ----------
+        local_path : str
+            Path to the file to write.
+        artifact_path : Optional[str]
+            If provided, the directory in ``artifact_uri`` to write to.
+        """
+        raise NotImplementedError(f"Please implement the `log_metrics` method.")
+
     def set_tags(self, **kwargs):
         """
         Log a batch of tags for the current run.
@@ -159,6 +198,28 @@ class Recorder:
         Returns
         -------
         A list of artifacts information (name, path, etc.) that being stored.
+        """
+        raise NotImplementedError(f"Please implement the `list_artifacts` method.")
+
+    def download_artifact(self, path: str, dst_path: Optional[str] = None) -> str:
+        """
+        Download an artifact file or directory from a run to a local directory if applicable,
+        and return a local path for it.
+
+        Parameters
+        ----------
+        path : str
+            Relative source path to the desired artifact.
+        dst_path : Optional[str]
+            Absolute path of the local filesystem destination directory to which to
+            download the specified artifacts. This directory must already exist.
+            If unspecified, the artifacts will either be downloaded to a new
+            uniquely-named directory on the local filesystem.
+
+        Returns
+        -------
+        str
+            Local path of desired artifact.
         """
         raise NotImplementedError(f"Please implement the `list_artifacts` method.")
 
@@ -199,6 +260,14 @@ class MLflowRecorder(Recorder):
 
     Due to the fact that mlflow will only log artifact from a file or directory, we decide to
     use file manager to help maintain the objects in the project.
+
+    Instead of using mlflow directly, we use another interface wrapping mlflow to log experiments.
+    Though it takes extra efforts, but it brings users benefits due to following reasons.
+    - It will be more convenient to change the experiment logging backend without changing any code in upper level
+    - We can provide more convenience to automatically do some extra things and make interface easier. For examples:
+        - Automatically logging the uncommitted code
+        - Automatically logging part of environment variables
+        - User can control several different runs by just creating different Recorder (in mlflow, you always have to switch artifact_uri and pass in run ids frequently)
     """
 
     def __init__(self, experiment_id, uri, name=None, mlflow_run=None):
@@ -222,6 +291,8 @@ class MLflowRecorder(Recorder):
                 if mlflow_run.info.end_time is not None
                 else None
             )
+            self._artifact_uri = mlflow_run.info.artifact_uri
+        self.async_log = None
 
     def __repr__(self):
         name = self.__class__.__name__
@@ -256,7 +327,10 @@ class MLflowRecorder(Recorder):
         This function will return the directory path of this recorder.
         """
         if self.artifact_uri is not None:
-            local_dir_path = Path(self.artifact_uri.lstrip("file:")) / ".."
+            if platform.system() == "Windows":
+                local_dir_path = Path(self.artifact_uri.lstrip("file:").lstrip("/")).parent
+            else:
+                local_dir_path = Path(self.artifact_uri.lstrip("file:")).parent
             local_dir_path = str(local_dir_path.resolve())
             if os.path.isdir(local_dir_path):
                 return local_dir_path
@@ -264,7 +338,7 @@ class MLflowRecorder(Recorder):
                 raise RuntimeError("This recorder is not saved in the local file system.")
 
         else:
-            raise Exception(
+            raise ValueError(
                 "Please make sure the recorder has been created and started properly before getting artifact uri."
             )
 
@@ -280,7 +354,38 @@ class MLflowRecorder(Recorder):
         self.status = Recorder.STATUS_R
         logger.info(f"Recorder {self.id} starts running under Experiment {self.experiment_id} ...")
 
+        # NOTE: making logging async.
+        # - This may cause delay when uploading results
+        # - The logging time may not be accurate
+        self.async_log = AsyncCaller()
+
+        # TODO: currently, this is only supported in MLflowRecorder.
+        # Maybe we can make this feature more general.
+        self._log_uncommitted_code()
+
+        self.log_params(**{"cmd-sys.argv": " ".join(sys.argv)})  # log the command to produce current experiment
+        self.log_params(
+            **{k: v for k, v in os.environ.items() if k.startswith("_QLIB_")}
+        )  # Log necessary environment variables
         return run
+
+    def _log_uncommitted_code(self):
+        """
+        Mlflow only log the commit id of the current repo. But usually, user will have a lot of uncommitted changes.
+        So this tries to automatically to log them all.
+        """
+        # TODO: the sub-directories maybe git repos.
+        # So it will be better if we can walk the sub-directories and log the uncommitted changes.
+        for cmd, fname in [
+            ("git diff", "code_diff.txt"),
+            ("git status", "code_status.txt"),
+            ("git diff --cached", "code_cached.txt"),
+        ]:
+            try:
+                out = subprocess.check_output(cmd, shell=True)
+                self.client.log_text(self.id, out.decode(), fname)  # this behaves same as above
+            except subprocess.CalledProcessError:
+                logger.info(f"Fail to log the uncommitted code of $CWD({os.getcwd()}) when run {cmd}.")
 
     def end_run(self, status: str = Recorder.STATUS_S):
         assert status in [
@@ -289,37 +394,113 @@ class MLflowRecorder(Recorder):
             Recorder.STATUS_FI,
             Recorder.STATUS_FA,
         ], f"The status type {status} is not supported."
-        mlflow.end_run(status)
         self.end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if self.status != Recorder.STATUS_S:
             self.status = status
+        if self.async_log is not None:
+            # Waiting Queue should go before mlflow.end_run. Otherwise mlflow will raise error
+            with TimeInspector.logt("waiting `async_log`"):
+                self.async_log.wait()
+        self.async_log = None
+        mlflow.end_run(status)
 
     def save_objects(self, local_path=None, artifact_path=None, **kwargs):
         assert self.uri is not None, "Please start the experiment and recorder first before using recorder directly."
         if local_path is not None:
-            self.client.log_artifacts(self.id, local_path, artifact_path)
+            path = Path(local_path)
+            if path.is_dir():
+                self.client.log_artifacts(self.id, local_path, artifact_path)
+            else:
+                self.client.log_artifact(self.id, local_path, artifact_path)
         else:
             temp_dir = Path(tempfile.mkdtemp()).resolve()
             for name, data in kwargs.items():
-                with (temp_dir / name).open("wb") as f:
-                    pickle.dump(data, f)
+                path = temp_dir / name
+                Serializable.general_dump(data, path)
                 self.client.log_artifact(self.id, temp_dir / name, artifact_path)
             shutil.rmtree(temp_dir)
 
-    def load_object(self, name):
-        assert self.uri is not None, "Please start the experiment and recorder first before using recorder directly."
-        path = self.client.download_artifacts(self.id, name)
-        with Path(path).open("rb") as f:
-            return pickle.load(f)
+    def load_object(self, name, unpickler=None, *, trusted=False):
+        """
+        Load object such as prediction file or model checkpoint in mlflow.
 
+        Args:
+            name (str): the object name
+
+            unpickler: Optional custom unpickler. Custom unpicklers are trusted
+                code and may execute arbitrary code while loading an artifact.
+            trusted (bool): Use Python's unrestricted pickle loader. This must
+                only be enabled for artifacts from a trusted source.
+
+        Raises:
+            LoadObjectError: if raise some exceptions when load the object
+
+        Returns:
+            object: the saved object in mlflow.
+        """
+        assert self.uri is not None, "Please start the experiment and recorder first before using recorder directly."
+
+        trusted = validate_trusted(trusted)
+        if trusted and unpickler is not None:
+            raise ValueError("`trusted` and `unpickler` cannot be used together")
+
+        path = None
+        try:
+            path = self.client.download_artifacts(self.id, name)
+            with Path(path).open("rb") as f:
+                if trusted:
+                    warnings.warn(
+                        "Loading a trusted pickle artifact may execute arbitrary code. "
+                        "Only use trusted=True when the artifact source and storage are trusted.",
+                        UnsafeArtifactWarning,
+                        stacklevel=2,
+                    )
+                    loader = pickle.Unpickler(f)
+                elif unpickler is not None:
+                    warnings.warn(
+                        "A custom artifact unpickler may execute arbitrary code.",
+                        UnsafeArtifactWarning,
+                        stacklevel=2,
+                    )
+                    loader = unpickler(f)
+                else:
+                    loader = RestrictedUnpickler(f)
+                data = loader.load()
+            return data
+        except pickle.UnpicklingError as e:
+            if not trusted and unpickler is None:
+                guide = "" if ARTIFACT_MIGRATION_URL in str(e) else f" Migration guide: {ARTIFACT_MIGRATION_URL}"
+                raise LoadObjectError(
+                    f"Restricted loading of artifact {name!r} failed: {e}. "
+                    "Use a supported data representation, or explicitly set trusted=True "
+                    "on load_object() or the workflow entry point only when both the artifact "
+                    "source and storage are trusted. Unrestricted pickle may execute arbitrary code."
+                    f"{guide}"
+                ) from e
+            raise LoadObjectError(str(e)) from e
+        except Exception as e:
+            raise LoadObjectError(str(e)) from e
+        finally:
+            ar = self.client._tracking_client._get_artifact_repo(self.id)
+            if isinstance(ar, AzureBlobArtifactRepository) and path is not None:
+                # for saving disk space
+                # For safety, only remove redundant file for specific ArtifactRepository
+                shutil.rmtree(Path(path).absolute().parent)
+
+    @AsyncCaller.async_dec(ac_attr="async_log")
     def log_params(self, **kwargs):
         for name, data in kwargs.items():
             self.client.log_param(self.id, name, data)
 
+    @AsyncCaller.async_dec(ac_attr="async_log")
     def log_metrics(self, step=None, **kwargs):
         for name, data in kwargs.items():
             self.client.log_metric(self.id, name, data, step=step)
 
+    def log_artifact(self, local_path, artifact_path: Optional[str] = None):
+        self.client.log_artifact(self.id, local_path=local_path, artifact_path=artifact_path)
+
+    @AsyncCaller.async_dec(ac_attr="async_log")
     def set_tags(self, **kwargs):
         for name, data in kwargs.items():
             self.client.set_tag(self.id, name, data)
@@ -332,7 +513,7 @@ class MLflowRecorder(Recorder):
         if self.artifact_uri is not None:
             return self.artifact_uri
         else:
-            raise Exception(
+            raise ValueError(
                 "Please make sure the recorder has been created and started properly before getting artifact uri."
             )
 
@@ -340,6 +521,9 @@ class MLflowRecorder(Recorder):
         assert self.uri is not None, "Please start the experiment and recorder first before using recorder directly."
         artifacts = self.client.list_artifacts(self.id, artifact_path)
         return [art.path for art in artifacts]
+
+    def download_artifact(self, path: str, dst_path: Optional[str] = None) -> str:
+        return self.client.download_artifacts(self.id, path, dst_path)
 
     def list_metrics(self):
         run = self.client.get_run(self.id)

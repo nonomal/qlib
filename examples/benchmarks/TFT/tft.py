@@ -1,6 +1,8 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+from pathlib import Path
+from typing import Union
 import numpy as np
 import pandas as pd
 import tensorflow.compat.v1 as tf
@@ -16,7 +18,6 @@ import datetime as dte
 from qlib.model.base import ModelFT
 from qlib.data.dataset import DatasetH
 from qlib.data.dataset.handler import DataHandlerLP
-
 
 # To register new datasets, please add them here.
 ALLOW_DATASET = ["Alpha158", "Alpha360"]
@@ -76,13 +77,15 @@ DATASET_SETTING = {
 
 
 def get_shifted_label(data_df, shifts=5, col_shift="LABEL0"):
-    return data_df[[col_shift]].groupby("instrument").apply(lambda df: df.shift(shifts))
+    return data_df[[col_shift]].groupby("instrument", group_keys=False).apply(lambda df: df.shift(shifts))
 
 
 def fill_test_na(test_df):
     test_df_res = test_df.copy()
     feature_cols = ~test_df_res.columns.str.contains("label", case=False)
-    test_feature_fna = test_df_res.loc[:, feature_cols].groupby("datetime").apply(lambda df: df.fillna(df.mean()))
+    test_feature_fna = (
+        test_df_res.loc[:, feature_cols].groupby("datetime", group_keys=False).apply(lambda df: df.fillna(df.mean()))
+    )
     test_df_res.loc[:, feature_cols] = test_feature_fna
     return test_df_res
 
@@ -207,7 +210,6 @@ class TFTModel(ModelFT):
         fixed_params = self.data_formatter.get_experiment_params()
         params = self.data_formatter.get_default_model_params()
 
-        # Wendi: 合并调优的参数和非调优的参数
         params = {**params, **fixed_params}
 
         if not os.path.exists(self.model_folder):
@@ -243,7 +245,7 @@ class TFTModel(ModelFT):
             #    extract_numerical_data(targets), extract_numerical_data(p90_forecast),
             #    0.9)
             tf.keras.backend.set_session(default_keras_session)
-        print("Training completed.".format(dte.datetime.now()))
+        print("Training completed at {}.".format(dte.datetime.now()))
         # ===========================Training Process===========================
 
     def predict(self, dataset):
@@ -289,3 +291,31 @@ class TFTModel(ModelFT):
             dataset for finetuning
         """
         pass
+
+    def to_pickle(self, path: Union[Path, str]):
+        """
+        Tensorflow model can't be dumped directly.
+        So the data should be save separately
+
+        **TODO**: Please implement the function to load the files
+
+        Parameters
+        ----------
+        path : Union[Path, str]
+            the target path to be dumped
+        """
+        # FIXME: implementing saving tensorflow models
+        # save tensorflow model
+        # path = Path(path)
+        # path.mkdir(parents=True)
+        # self.model.save(path)
+
+        # save qlib model wrapper
+        drop_attrs = ["model", "tf_graph", "sess", "data_formatter"]
+        orig_attr = {}
+        for attr in drop_attrs:
+            orig_attr[attr] = getattr(self, attr)
+            setattr(self, attr, None)
+        super(TFTModel, self).to_pickle(path)
+        for attr in drop_attrs:
+            setattr(self, attr, orig_attr[attr])

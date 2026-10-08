@@ -4,7 +4,7 @@
 import pandas as pd
 
 
-from ...backtest.profit_attribution import get_stock_weight_df
+from ....backtest.profit_attribution import get_stock_weight_df
 
 
 def parse_position(position: dict = None) -> pd.DataFrame:
@@ -33,15 +33,16 @@ def parse_position(position: dict = None) -> pd.DataFrame:
 
     position_weight_df = get_stock_weight_df(position)
     # If the day does not exist, use the last weight
-    position_weight_df.fillna(method="ffill", inplace=True)
+    position_weight_df.ffill(inplace=True)
 
     previous_data = {"date": None, "code_list": []}
 
     result_df = pd.DataFrame()
     for _trading_date, _value in position.items():
+        _value = _value.position
         # pd_date type: pd.Timestamp
         _cash = _value.pop("cash")
-        for _item in ["today_account_value"]:
+        for _item in ["now_account_value"]:
             if _item in _value:
                 _value.pop(_item)
 
@@ -68,9 +69,9 @@ def parse_position(position: dict = None) -> pd.DataFrame:
             if not _trading_day_sell_df.empty:
                 _trading_day_sell_df["status"] = -1
                 _trading_day_sell_df["date"] = _trading_date
-                _trading_day_df = _trading_day_df.append(_trading_day_sell_df, sort=False)
+                _trading_day_df = pd.concat([_trading_day_df, _trading_day_sell_df], sort=False)
 
-        result_df = result_df.append(_trading_day_df, sort=True)
+        result_df = pd.concat([result_df, _trading_day_df], sort=True)
 
         previous_data = dict(
             date=_trading_date,
@@ -131,7 +132,7 @@ def _calculate_label_rank(df: pd.DataFrame) -> pd.DataFrame:
         g_df["excess_return"] = g_df[_label_name] - g_df[_label_name].mean()
         return g_df
 
-    return df.groupby(level="datetime").apply(_calculate_day_value)
+    return df.groupby(level="datetime", group_keys=False).apply(_calculate_day_value)
 
 
 def get_position_data(

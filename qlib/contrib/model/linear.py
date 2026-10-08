@@ -4,6 +4,8 @@
 import numpy as np
 import pandas as pd
 from typing import Text, Union
+from qlib.log import get_module_logger
+from qlib.data.dataset.weight import Reweighter
 from scipy.optimize import nnls
 from sklearn.linear_model import LinearRegression, Ridge, Lasso
 
@@ -28,7 +30,7 @@ class LinearModel(Model):
     RIDGE = "ridge"
     LASSO = "lasso"
 
-    def __init__(self, estimator="ols", alpha=0.0, fit_intercept=False):
+    def __init__(self, estimator="ols", alpha=0.0, fit_intercept=False, include_valid: bool = False):
         """
         Parameters
         ----------
@@ -38,6 +40,9 @@ class LinearModel(Model):
             l1 or l2 regularization parameter
         fit_intercept : bool
             whether fit intercept
+        include_valid: bool
+            Should the validation data be included for training?
+            The validation data should be included
         """
         assert estimator in [self.OLS, self.NNLS, self.RIDGE, self.LASSO], f"unsupported estimator `{estimator}`"
         self.estimator = estimator
@@ -48,32 +53,49 @@ class LinearModel(Model):
         self.fit_intercept = fit_intercept
 
         self.coef_ = None
+        self.include_valid = include_valid
 
-    def fit(self, dataset: DatasetH):
+    def fit(self, dataset: DatasetH, reweighter: Reweighter = None):
         df_train = dataset.prepare("train", col_set=["feature", "label"], data_key=DataHandlerLP.DK_L)
+        if self.include_valid:
+            try:
+                df_valid = dataset.prepare("valid", col_set=["feature", "label"], data_key=DataHandlerLP.DK_L)
+                df_train = pd.concat([df_train, df_valid])
+            except KeyError:
+                get_module_logger("LinearModel").info("include_valid=True, but valid does not exist")
+        df_train = df_train.dropna()
+        if df_train.empty:
+            raise ValueError("Empty data from dataset, please check your dataset config.")
+        if reweighter is not None:
+            w: pd.Series = reweighter.reweight(df_train)
+            w = w.values
+        else:
+            w = None
         X, y = df_train["feature"].values, np.squeeze(df_train["label"].values)
 
         if self.estimator in [self.OLS, self.RIDGE, self.LASSO]:
-            self._fit(X, y)
+            self._fit(X, y, w)
         elif self.estimator == self.NNLS:
-            self._fit_nnls(X, y)
+            self._fit_nnls(X, y, w)
         else:
             raise ValueError(f"unknown estimator `{self.estimator}`")
 
         return self
 
-    def _fit(self, X, y):
+    def _fit(self, X, y, w):
         if self.estimator == self.OLS:
             model = LinearRegression(fit_intercept=self.fit_intercept, copy_X=False)
         else:
             model = {self.RIDGE: Ridge, self.LASSO: Lasso}[self.estimator](
                 alpha=self.alpha, fit_intercept=self.fit_intercept, copy_X=False
             )
-        model.fit(X, y)
+        model.fit(X, y, sample_weight=w)
         self.coef_ = model.coef_
         self.intercept_ = model.intercept_
 
-    def _fit_nnls(self, X, y):
+    def _fit_nnls(self, X, y, w=None):
+        if w is not None:
+            raise NotImplementedError("TODO: support nnls with weight")  # TODO
         if self.fit_intercept:
             X = np.c_[X, np.ones(len(X))]  # NOTE: mem copy
         coef = nnls(X, y)[0]

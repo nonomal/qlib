@@ -13,12 +13,12 @@ from .config import C
 
 
 class MetaLogger(type):
-    def __new__(cls, name, bases, dict):
+    def __new__(mcs, name, bases, attrs):  # pylint: disable=C0204
         wrapper_dict = logging.Logger.__dict__.copy()
-        for key in wrapper_dict:
-            if key not in dict and key != "__reduce__":
-                dict[key] = wrapper_dict[key]
-        return type.__new__(cls, name, bases, dict)
+        for key, val in wrapper_dict.items():
+            if key not in attrs and key != "__reduce__":
+                attrs[key] = val
+        return type.__new__(mcs, name, bases, attrs)
 
 
 class QlibLogger(metaclass=MetaLogger):
@@ -28,16 +28,18 @@ class QlibLogger(metaclass=MetaLogger):
 
     def __init__(self, module_name):
         self.module_name = module_name
-        self.level = 0
+        # this feature name conflicts with the attribute with Logger
+        # rename it to avoid some corner cases that result in comparing `str` and `int`
+        self.__level = 0
 
     @property
     def logger(self):
         logger = logging.getLogger(self.module_name)
-        logger.setLevel(self.level)
+        logger.setLevel(self.__level)
         return logger
 
     def setLevel(self, level):
-        self.level = level
+        self.__level = level
 
     def __getattr__(self, name):
         # During unpickling, python will call __getattr__. Use this line to avoid maximum recursion error.
@@ -46,29 +48,43 @@ class QlibLogger(metaclass=MetaLogger):
         return self.logger.__getattribute__(name)
 
 
-def get_module_logger(module_name, level: Optional[int] = None) -> logging.Logger:
-    """
-    Get a logger for a specific module.
+class _QLibLoggerManager:
+    def __init__(self):
+        self._loggers = {}
 
-    :param module_name: str
-        Logic module name.
-    :param level: int
-    :return: Logger
-        Logger object.
-    """
-    if level is None:
-        level = C.logging_level
+    def setLevel(self, level):
+        for logger in self._loggers.values():
+            logger.setLevel(level)
 
-    module_name = "qlib.{}".format(module_name)
-    # Get logger.
-    module_logger = QlibLogger(module_name)
-    module_logger.setLevel(level)
-    return module_logger
+    def __call__(self, module_name, level: Optional[int] = None) -> QlibLogger:
+        """
+        Get a logger for a specific module.
+
+        :param module_name: str
+            Logic module name.
+        :param level: int
+        :return: Logger
+            Logger object.
+        """
+        if level is None:
+            level = C.logging_level
+
+        if not module_name.startswith("qlib."):
+            # Add a prefix of qlib. when the requested ``module_name`` doesn't start with ``qlib.``.
+            # If the module_name is already qlib.xxx, we do not format here. Otherwise, it will become qlib.qlib.xxx.
+            module_name = "qlib.{}".format(module_name)
+
+        # Get logger.
+        module_logger = self._loggers.setdefault(module_name, QlibLogger(module_name))
+        module_logger.setLevel(level)
+        return module_logger
+
+
+get_module_logger = _QLibLoggerManager()
 
 
 class TimeInspector:
-
-    timer_logger = get_module_logger("timer", level=logging.WARNING)
+    timer_logger = get_module_logger("timer")
 
     time_marks = []
 
@@ -105,7 +121,7 @@ class TimeInspector:
         """
         Get last time mark from stack, calculate time diff with current time, and log time diff and info.
         :param info: str
-            Info that will be log into stdout.
+            Info that will be logged into stdout.
         """
         cost_time = time() - cls.time_marks.pop()
         cls.timer_logger.info("Time cost: {0:.3f}s | {1}".format(cost_time, info))
@@ -144,6 +160,7 @@ def set_log_with_config(log_config: Dict[Text, Any]):
 
 class LogFilter(logging.Filter):
     def __init__(self, param=None):
+        super().__init__()
         self.param = param
 
     @staticmethod
@@ -161,7 +178,7 @@ class LogFilter(logging.Filter):
         if isinstance(self.param, str):
             allow = not self.match_msg(self.param, record.msg)
         elif isinstance(self.param, list):
-            allow = not any([self.match_msg(p, record.msg) for p in self.param])
+            allow = not any(self.match_msg(p, record.msg) for p in self.param)
         return allow
 
 
@@ -198,7 +215,7 @@ def set_global_logger_level(level: int, return_orig_handler_level: bool = False)
 
     """
     _handler_level_map = {}
-    qlib_logger = logging.root.manager.loggerDict.get("qlib", None)
+    qlib_logger = logging.root.manager.loggerDict.get("qlib", None)  # pylint: disable=E1101
     if qlib_logger is not None:
         for _handler in qlib_logger.handlers:
             _handler_level_map[_handler] = _handler.level

@@ -3,7 +3,7 @@ Qlib FAQ
 ############
 
 Qlib Frequently Asked Questions
-================================
+===============================
 .. contents::
     :depth: 1
     :local:
@@ -13,7 +13,7 @@ Qlib Frequently Asked Questions
 
 
 1. RuntimeError: An attempt has been made to start a new process before the current process has finished its bootstrapping phase...
-------------------------------------------------------------------------------------------------------------------------------------
+-----------------------------------------------------------------------------------------------------------------------------------
 
 .. code-block:: console
 
@@ -52,7 +52,7 @@ This is caused by the limitation of multiprocessing under windows OS. Please ref
 
 
 2. qlib.data.cache.QlibCacheException: It sees the key(...) of the redis lock has existed in your redis db now.
------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------
 
 It sees the key of the redis lock has existed in your redis db now. You can use the following command to clear your redis keys and rerun your commands
 
@@ -72,7 +72,7 @@ If the issue is not resolved, use ``keys *`` to find if multiple keys exist. If 
 Also, feel free to post a new issue in our GitHub repository. We always check each issue carefully and try our best to solve them.
 
 3. ModuleNotFoundError: No module named 'qlib.data._libs.rolling'
-------------------------------------------------------------------------------------------------------------------------------------
+-----------------------------------------------------------------
 
 .. code-block:: python
 
@@ -98,3 +98,56 @@ Also, feel free to post a new issue in our GitHub repository. We always check ea
         python setup.py build_ext --inplace
 
 - If the error occurs when importing ``qlib`` package with command ``python`` , users need to change the running directory to ensure that the script does not run in the project directory.
+
+
+4. BadNamespaceError: / is not a connected namespace
+----------------------------------------------------
+
+.. code-block:: python
+
+      File "qlib_online.py", line 35, in <module>
+        cal = D.calendar()
+      File "e:\code\python\microsoft\qlib_latest\qlib\qlib\data\data.py", line 973, in calendar
+        return Cal.calendar(start_time, end_time, freq, future=future)
+      File "e:\code\python\microsoft\qlib_latest\qlib\qlib\data\data.py", line 798, in calendar
+        self.conn.send_request(
+      File "e:\code\python\microsoft\qlib_latest\qlib\qlib\data\client.py", line 101, in send_request
+        self.sio.emit(request_type + "_request", request_content)
+      File "G:\apps\miniconda\envs\qlib\lib\site-packages\python_socketio-5.3.0-py3.8.egg\socketio\client.py", line 369, in emit
+        raise exceptions.BadNamespaceError(
+      BadNamespaceError: / is not a connected namespace.
+
+- The version of ``python-socketio`` in qlib needs to be the same as the version of ``python-socketio`` in qlib-server:
+
+    .. code-block:: bash
+
+        pip install -U python-socketio==<qlib-server python-socketio version>
+
+
+5. TypeError: send() got an unexpected keyword argument 'binary'
+----------------------------------------------------------------
+
+.. code-block:: python
+
+      File "qlib_online.py", line 35, in <module>
+        cal = D.calendar()
+      File "e:\code\python\microsoft\qlib_latest\qlib\qlib\data\data.py", line 973, in calendar
+        return Cal.calendar(start_time, end_time, freq, future=future)
+      File "e:\code\python\microsoft\qlib_latest\qlib\qlib\data\data.py", line 798, in calendar
+        self.conn.send_request(
+      File "e:\code\python\microsoft\qlib_latest\qlib\qlib\data\client.py", line 101, in send_request
+        self.sio.emit(request_type + "_request", request_content)
+      File "G:\apps\miniconda\envs\qlib\lib\site-packages\socketio\client.py", line 263, in emit
+        self._send_packet(packet.Packet(packet.EVENT, namespace=namespace,
+      File "G:\apps\miniconda\envs\qlib\lib\site-packages\socketio\client.py", line 339, in _send_packet
+        self.eio.send(ep, binary=binary)
+      TypeError: send() got an unexpected keyword argument 'binary'
+
+
+- The ``python-engineio`` version needs to be compatible with the ``python-socketio`` version, reference: https://github.com/miguelgrinberg/python-socketio#version-compatibility
+
+    .. code-block:: bash
+
+        pip install -U python-engineio==<compatible python-socketio version>
+        # or
+        pip install -U python-socketio==3.1.2 python-engineio==3.13.2

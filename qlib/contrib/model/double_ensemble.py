@@ -8,10 +8,11 @@ from typing import Text, Union
 from ...model.base import Model
 from ...data.dataset import DatasetH
 from ...data.dataset.handler import DataHandlerLP
+from ...model.interpret.base import FeatureInt
 from ...log import get_module_logger
 
 
-class DEnsembleModel(Model):
+class DEnsembleModel(Model, FeatureInt):
     """Double Ensemble Model"""
 
     def __init__(
@@ -29,7 +30,8 @@ class DEnsembleModel(Model):
         sample_ratios=None,
         sub_weights=None,
         epochs=100,
-        **kwargs
+        early_stopping_rounds=None,
+        **kwargs,
     ):
         self.base_model = base_model  # "gbm" or "mlp", specifically, we use lgbm for "gbm"
         self.num_models = num_models  # the number of sub-models
@@ -43,7 +45,7 @@ class DEnsembleModel(Model):
         if sample_ratios is None:  # the default values for sample_ratios
             sample_ratios = [0.8, 0.7, 0.6, 0.5, 0.4]
         if sub_weights is None:  # the default values for sub_weights
-            sub_weights = [1.0, 0.2, 0.2, 0.2, 0.2, 0.2]
+            sub_weights = [1] * self.num_models
         if not len(sample_ratios) == bins_fs:
             raise ValueError("The length of sample_ratios should be equal to bins_fs.")
         self.sample_ratios = sample_ratios
@@ -58,11 +60,14 @@ class DEnsembleModel(Model):
         self.params = {"objective": loss}
         self.params.update(kwargs)
         self.loss = loss
+        self.early_stopping_rounds = early_stopping_rounds
 
     def fit(self, dataset: DatasetH):
         df_train, df_valid = dataset.prepare(
             ["train", "valid"], col_set=["feature", "label"], data_key=DataHandlerLP.DK_L
         )
+        if df_train.empty or df_valid.empty:
+            raise ValueError("Empty data from dataset, please check your dataset config.")
         x_train, y_train = df_train["feature"], df_train["label"]
         # initialize the sample weights
         N, F = x_train.shape
@@ -84,7 +89,9 @@ class DEnsembleModel(Model):
             loss_curve = self.retrieve_loss_curve(model_k, df_train, features)
             pred_k = self.predict_sub(model_k, df_train, features)
             pred_sub.iloc[:, k] = pred_k
-            pred_ensemble = pred_sub.iloc[:, : k + 1].mean(axis=1)
+            pred_ensemble = (pred_sub.iloc[:, : k + 1] * self.sub_weights[0 : k + 1]).sum(axis=1) / np.sum(
+                self.sub_weights[0 : k + 1]
+            )
             loss_values = pd.Series(self.get_loss(y_train.values.squeeze(), pred_ensemble.values))
 
             if self.enable_sr:
@@ -98,14 +105,19 @@ class DEnsembleModel(Model):
     def train_submodel(self, df_train, df_valid, weights, features):
         dtrain, dvalid = self._prepare_data_gbm(df_train, df_valid, weights, features)
         evals_result = dict()
+
+        callbacks = [lgb.log_evaluation(20), lgb.record_evaluation(evals_result)]
+        if self.early_stopping_rounds:
+            callbacks.append(lgb.early_stopping(self.early_stopping_rounds))
+            self.logger.info("Training with early_stopping...")
+
         model = lgb.train(
             self.params,
             dtrain,
             num_boost_round=self.epochs,
             valid_sets=[dtrain, dvalid],
             valid_names=["train", "valid"],
-            verbose_eval=20,
-            evals_result=evals_result,
+            callbacks=callbacks,
         )
         evals_result["train"] = list(evals_result["train"].values())[0]
         evals_result["valid"] = list(evals_result["valid"].values())[0]
@@ -121,8 +133,8 @@ class DEnsembleModel(Model):
         else:
             raise ValueError("LightGBM doesn't support multi-label training")
 
-        dtrain = lgb.Dataset(x_train.values, label=y_train, weight=weights)
-        dvalid = lgb.Dataset(x_valid.values, label=y_valid)
+        dtrain = lgb.Dataset(x_train, label=y_train, weight=weights)
+        dvalid = lgb.Dataset(x_valid, label=y_valid)
         return dtrain, dvalid
 
     def sample_reweight(self, loss_curve, loss_values, k_th):
@@ -154,10 +166,10 @@ class DEnsembleModel(Model):
 
         # calculate weights
         h["bins"] = pd.cut(h["h_value"], self.bins_sr)
-        h_avg = h.groupby("bins")["h_value"].mean()
+        h_avg = h.groupby("bins", group_keys=False, observed=False)["h_value"].mean()
         weights = pd.Series(np.zeros(N, dtype=float))
-        for i_b, b in enumerate(h_avg.index):
-            weights[h["bins"] == b] = 1.0 / (self.decay ** k_th * h_avg[i_b] + 0.1)
+        for b in h_avg.index:
+            weights[h["bins"] == b] = 1.0 / (self.decay**k_th * h_avg[b] + 0.1)
         return weights
 
     def feature_selection(self, df_train, loss_values):
@@ -203,8 +215,8 @@ class DEnsembleModel(Model):
         for i_b, b in enumerate(sorted_bins):
             b_feat = features[g["bins"] == b]
             num_feat = int(np.ceil(self.sample_ratios[i_b] * len(b_feat)))
-            res_feat = res_feat + np.random.choice(b_feat, size=num_feat).tolist()
-        return pd.Index(res_feat)
+            res_feat = res_feat + np.random.choice(b_feat, size=num_feat, replace=False).tolist()
+        return pd.Index(set(res_feat))
 
     def get_loss(self, label, pred):
         if self.loss == "mse":
@@ -243,9 +255,23 @@ class DEnsembleModel(Model):
                 pd.Series(submodel.predict(x_test.loc[:, feat_sub].values), index=x_test.index)
                 * self.sub_weights[i_sub]
             )
+        pred = pred / np.sum(self.sub_weights)
         return pred
 
     def predict_sub(self, submodel, df_data, features):
-        x_data, y_data = df_data["feature"].loc[:, features], df_data["label"]
+        x_data = df_data["feature"].loc[:, features]
         pred_sub = pd.Series(submodel.predict(x_data.values), index=x_data.index)
         return pred_sub
+
+    def get_feature_importance(self, *args, **kwargs) -> pd.Series:
+        """get feature importance
+
+        Notes
+        -----
+            parameters reference:
+            https://lightgbm.readthedocs.io/en/latest/pythonapi/lightgbm.Booster.html?highlight=feature_importance#lightgbm.Booster.feature_importance
+        """
+        res = []
+        for _model, _weight in zip(self.ensemble, self.sub_weights):
+            res.append(pd.Series(_model.feature_importance(*args, **kwargs), index=_model.feature_name()) * _weight)
+        return pd.concat(res, axis=1, sort=False).sum(axis=1).sort_values(ascending=False)

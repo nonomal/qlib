@@ -3,3 +3,6 @@ cmake
 numpy
 scipy
 scikit-learn
+pandas
+tianshou
+sphinx_rtd_theme

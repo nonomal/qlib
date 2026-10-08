@@ -2,25 +2,26 @@
 # Licensed under the MIT License.
 
 import abc
+from functools import partial
 import sys
-import importlib
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from typing import List
+from io import StringIO
 
 import fire
 import requests
 import pandas as pd
 from tqdm import tqdm
 from loguru import logger
-
+from fake_useragent import UserAgent
 
 CUR_DIR = Path(__file__).resolve().parent
 sys.path.append(str(CUR_DIR.parent.parent))
 
 from data_collector.index import IndexBase
 from data_collector.utils import deco_retry, get_calendar_list, get_trading_date_by_shift
-
+from data_collector.utils import get_instruments
 
 WIKI_URL = "https://en.wikipedia.org/wiki"
 
@@ -37,12 +38,20 @@ class WIKIIndex(IndexBase):
     # https://superuser.com/questions/613313/why-cant-we-make-con-prn-null-folder-in-windows
     INST_PREFIX = ""
 
-    def __init__(self, index_name: str, qlib_dir: [str, Path] = None, request_retry: int = 5, retry_sleep: int = 3):
+    def __init__(
+        self,
+        index_name: str,
+        qlib_dir: [str, Path] = None,
+        freq: str = "day",
+        request_retry: int = 5,
+        retry_sleep: int = 3,
+    ):
         super(WIKIIndex, self).__init__(
-            index_name=index_name, qlib_dir=qlib_dir, request_retry=request_retry, retry_sleep=retry_sleep
+            index_name=index_name, qlib_dir=qlib_dir, freq=freq, request_retry=request_retry, retry_sleep=retry_sleep
         )
 
         self._target_url = f"{WIKI_URL}/{WIKI_INDEX_NAME_MAP[self.index_name.upper()]}"
+        self._ua = UserAgent()
 
     @property
     @abc.abstractmethod
@@ -71,6 +80,24 @@ class WIKIIndex(IndexBase):
         """
         raise NotImplementedError("rewrite get_changes")
 
+    def format_datetime(self, inst_df: pd.DataFrame) -> pd.DataFrame:
+        """formatting the datetime in an instrument
+
+        Parameters
+        ----------
+        inst_df: pd.DataFrame
+            inst_df.columns = [self.SYMBOL_FIELD_NAME, self.START_DATE_FIELD, self.END_DATE_FIELD]
+
+        Returns
+        -------
+
+        """
+        if self.freq != "day":
+            inst_df[self.END_DATE_FIELD] = inst_df[self.END_DATE_FIELD].apply(
+                lambda x: (pd.Timestamp(x) + pd.Timedelta(hours=23, minutes=59)).strftime("%Y-%m-%d %H:%M:%S")
+            )
+        return inst_df
+
     @property
     def calendar_list(self) -> List[pd.Timestamp]:
         """get history trading date
@@ -86,7 +113,8 @@ class WIKIIndex(IndexBase):
         return _calendar_list
 
     def _request_new_companies(self) -> requests.Response:
-        resp = requests.get(self._target_url)
+        headers = {"User-Agent": self._ua.random}
+        resp = requests.get(self._target_url, timeout=None, headers=headers)
         if resp.status_code != 200:
             raise ValueError(f"request error: {self._target_url}")
 
@@ -102,7 +130,7 @@ class WIKIIndex(IndexBase):
     def get_new_companies(self):
         logger.info(f"get new companies {self.index_name} ......")
         _data = deco_retry(retry=self._request_retry, retry_sleep=self._retry_sleep)(self._request_new_companies)()
-        df_list = pd.read_html(_data.text)
+        df_list = pd.read_html(StringIO(_data.text))
         for _df in df_list:
             _df = self.filter_df(_df)
             if (_df is not None) and (not _df.empty):
@@ -116,7 +144,6 @@ class WIKIIndex(IndexBase):
 
 
 class NASDAQ100Index(WIKIIndex):
-
     HISTORY_COMPANIES_URL = (
         "https://indexes.nasdaqomx.com/Index/WeightingData?id=NDX&tradeDate={trade_date}T00%3A00%3A00.000&timeOfDay=SOD"
     )
@@ -138,7 +165,7 @@ class NASDAQ100Index(WIKIIndex):
             df = pd.read_pickle(cache_path)
         else:
             url = self.HISTORY_COMPANIES_URL.format(trade_date=trade_date)
-            resp = requests.post(url)
+            resp = requests.post(url, timeout=None)
             if resp.status_code != 200:
                 raise ValueError(f"request error: {url}")
             df = pd.DataFrame(resp.json()["aaData"])
@@ -201,7 +228,11 @@ class SP500Index(WIKIIndex):
     def get_changes(self) -> pd.DataFrame:
         logger.info(f"get sp500 history changes......")
         # NOTE: may update the index of the table
-        changes_df = pd.read_html(self.WIKISP500_CHANGES_URL)[-1]
+        # Add headers to avoid 403 Forbidden error from Wikipedia
+        headers = {"User-Agent": self._ua.random}
+        response = requests.get(self.WIKISP500_CHANGES_URL, headers=headers, timeout=None)
+        response.raise_for_status()
+        changes_df = pd.read_html(StringIO(response.text))[-1]
         changes_df = changes_df.iloc[:, [0, 1, 3]]
         changes_df.columns = [self.DATE_FIELD_NAME, self.ADD, self.REMOVE]
         changes_df[self.DATE_FIELD_NAME] = pd.to_datetime(changes_df[self.DATE_FIELD_NAME])
@@ -244,39 +275,5 @@ class SP400Index(WIKIIndex):
         logger.warning(f"No suitable data source has been found!")
 
 
-def get_instruments(
-    qlib_dir: str, index_name: str, method: str = "parse_instruments", request_retry: int = 5, retry_sleep: int = 3
-):
-    """
-
-    Parameters
-    ----------
-    qlib_dir: str
-        qlib data dir, default "Path(__file__).parent/qlib_data"
-    index_name: str
-        index name, value from ["SP500", "NASDAQ100", "DJIA", "SP400"]
-    method: str
-        method, value from ["parse_instruments", "save_new_companies"]
-    request_retry: int
-        request retry, by default 5
-    retry_sleep: int
-        request sleep, by default 3
-
-    Examples
-    -------
-        # parse instruments
-        $ python collector.py --index_name SP500 --qlib_dir ~/.qlib/qlib_data/cn_data --method parse_instruments
-
-        # parse new companies
-        $ python collector.py --index_name SP500 --qlib_dir ~/.qlib/qlib_data/cn_data --method save_new_companies
-
-    """
-    _cur_module = importlib.import_module("collector")
-    obj = getattr(_cur_module, f"{index_name.upper()}Index")(
-        qlib_dir=qlib_dir, index_name=index_name, request_retry=request_retry, retry_sleep=retry_sleep
-    )
-    getattr(obj, method)()
-
-
 if __name__ == "__main__":
-    fire.Fire(get_instruments)
+    fire.Fire(partial(get_instruments, market_index="us_index"))

@@ -1,8 +1,10 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from hyperopt import hp
+# pylint: skip-file
+# flake8: noqa
 
+from hyperopt import hp
 
 TopkAmountStrategySpace = {
     "topk": hp.choice("topk", [30, 35, 40]),

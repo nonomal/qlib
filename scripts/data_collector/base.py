@@ -7,24 +7,24 @@ import time
 import datetime
 import importlib
 from pathlib import Path
-from typing import Type
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from typing import Type, Iterable
+from concurrent.futures import ProcessPoolExecutor
 
 import pandas as pd
 from tqdm import tqdm
 from loguru import logger
+from joblib import Parallel, delayed
 from qlib.utils import code_to_fname
 
 
 class BaseCollector(abc.ABC):
-
     CACHE_FLAG = "CACHED"
     NORMAL_FLAG = "NORMAL"
 
     DEFAULT_START_DATETIME_1D = pd.Timestamp("2000-01-01")
-    DEFAULT_START_DATETIME_1MIN = pd.Timestamp(datetime.datetime.now() - pd.Timedelta(days=5 * 6))
-    DEFAULT_END_DATETIME_1D = pd.Timestamp(datetime.datetime.now() + pd.Timedelta(days=1))
-    DEFAULT_END_DATETIME_1MIN = pd.Timestamp(datetime.datetime.now() + pd.Timedelta(days=1))
+    DEFAULT_START_DATETIME_1MIN = pd.Timestamp(datetime.datetime.now() - pd.Timedelta(days=5 * 6 - 1)).date()
+    DEFAULT_END_DATETIME_1D = pd.Timestamp(datetime.datetime.now() + pd.Timedelta(days=1)).date()
+    DEFAULT_END_DATETIME_1MIN = DEFAULT_END_DATETIME_1D
 
     INTERVAL_1min = "1min"
     INTERVAL_1d = "1d"
@@ -35,10 +35,10 @@ class BaseCollector(abc.ABC):
         start=None,
         end=None,
         interval="1d",
-        max_workers=4,
+        max_workers=1,
         max_collector_count=2,
         delay=0,
-        check_data_length: bool = False,
+        check_data_length: int = None,
         limit_nums: int = None,
     ):
         """
@@ -48,7 +48,7 @@ class BaseCollector(abc.ABC):
         save_dir: str
             instrument save dir
         max_workers: int
-            workers, default 4
+            workers, default 1; Concurrent number, default is 1; when collecting data, it is recommended that max_workers be set to 1
         max_collector_count: int
             default 2
         delay: float
@@ -59,8 +59,8 @@ class BaseCollector(abc.ABC):
             start datetime, default None
         end: str
             end datetime, default None
-        check_data_length: bool
-            check data length, by default False
+        check_data_length: int
+            check data length, if not None and greater than 0, each symbol will be considered complete if its data length is greater than or equal to this value, otherwise it will be fetched again, the maximum number of fetches being (max_collector_count). By default None.
         limit_nums: int
             using for debug, by default None
         """
@@ -72,7 +72,7 @@ class BaseCollector(abc.ABC):
         self.max_collector_count = max_collector_count
         self.mini_symbol_map = {}
         self.interval = interval
-        self.check_small_data = check_data_length
+        self.check_data_length = max(int(check_data_length) if check_data_length is not None else 0, 0)
 
         self.start_datetime = self.normalize_start_datetime(start)
         self.end_datetime = self.normalize_end_datetime(end)
@@ -99,14 +99,6 @@ class BaseCollector(abc.ABC):
             else getattr(self, f"DEFAULT_END_DATETIME_{self.interval.upper()}")
         )
 
-    @property
-    @abc.abstractmethod
-    def min_numbers_trading(self):
-        # daily, one year: 252 / 4
-        # us 1min, a week: 6.5 * 60 * 5
-        # cn 1min, a week: 4 * 60 * 5
-        raise NotImplementedError("rewrite min_numbers_trading")
-
     @abc.abstractmethod
     def get_instrument_list(self):
         raise NotImplementedError("rewrite get_instrument_list")
@@ -132,7 +124,7 @@ class BaseCollector(abc.ABC):
 
         Returns
         ---------
-            pd.DataFrame, "symbol" in pd.columns
+            pd.DataFrame, "symbol" and "date"in pd.columns
 
         """
         raise NotImplementedError("rewrite get_timezone")
@@ -151,7 +143,7 @@ class BaseCollector(abc.ABC):
         self.sleep()
         df = self.get_data(symbol, self.interval, self.start_datetime, self.end_datetime)
         _result = self.NORMAL_FLAG
-        if self.check_small_data:
+        if self.check_data_length > 0:
             _result = self.cache_small_data(symbol, df)
         if _result == self.NORMAL_FLAG:
             self.save_instrument(symbol, df)
@@ -177,12 +169,12 @@ class BaseCollector(abc.ABC):
         df["symbol"] = symbol
         if instrument_path.exists():
             _old_df = pd.read_csv(instrument_path)
-            df = _old_df.append(df, sort=False)
+            df = pd.concat([_old_df, df], sort=False)
         df.to_csv(instrument_path, index=False)
 
     def cache_small_data(self, symbol, df):
-        if len(df) <= self.min_numbers_trading:
-            logger.warning(f"the number of trading days of {symbol} is less than {self.min_numbers_trading}!")
+        if len(df) < self.check_data_length:
+            logger.warning(f"the number of trading days of {symbol} is less than {self.check_data_length}!")
             _temp = self.mini_symbol_map.setdefault(symbol, [])
             _temp.append(df.copy())
             return self.CACHE_FLAG
@@ -192,14 +184,13 @@ class BaseCollector(abc.ABC):
             return self.NORMAL_FLAG
 
     def _collector(self, instrument_list):
-
         error_symbol = []
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            with tqdm(total=len(instrument_list)) as p_bar:
-                for _symbol, _result in zip(instrument_list, executor.map(self._simple_collector, instrument_list)):
-                    if _result != self.NORMAL_FLAG:
-                        error_symbol.append(_symbol)
-                    p_bar.update()
+        res = Parallel(n_jobs=self.max_workers)(
+            delayed(self._simple_collector)(_inst) for _inst in tqdm(instrument_list)
+        )
+        for _symbol, _result in zip(instrument_list, res):
+            if _result != self.NORMAL_FLAG:
+                error_symbol.append(_symbol)
         print(error_symbol)
         logger.info(f"error symbol nums: {len(error_symbol)}")
         logger.info(f"current get symbol nums: {len(instrument_list)}")
@@ -217,20 +208,16 @@ class BaseCollector(abc.ABC):
             instrument_list = self._collector(instrument_list)
             logger.info(f"{i+1} finish.")
         for _symbol, _df_list in self.mini_symbol_map.items():
-            self.save_instrument(
-                _symbol, pd.concat(_df_list, sort=False).drop_duplicates(["date"]).sort_values(["date"])
-            )
+            _df = pd.concat(_df_list, sort=False)
+            if not _df.empty:
+                self.save_instrument(_symbol, _df.drop_duplicates(["date"]).sort_values(["date"]))
         if self.mini_symbol_map:
-            logger.warning(f"less than {self.min_numbers_trading} instrument list: {list(self.mini_symbol_map.keys())}")
+            logger.warning(f"less than {self.check_data_length} instrument list: {list(self.mini_symbol_map.keys())}")
         logger.info(f"total {len(self.instrument_list)}, error: {len(set(instrument_list))}")
 
 
 class BaseNormalize(abc.ABC):
-    def __init__(
-        self,
-        date_field_name: str = "date",
-        symbol_field_name: str = "symbol",
-    ):
+    def __init__(self, date_field_name: str = "date", symbol_field_name: str = "symbol", **kwargs):
         """
 
         Parameters
@@ -242,7 +229,7 @@ class BaseNormalize(abc.ABC):
         """
         self._date_field_name = date_field_name
         self._symbol_field_name = symbol_field_name
-
+        self.kwargs = kwargs
         self._calendar_list = self._get_calendar_list()
 
     @abc.abstractmethod
@@ -251,7 +238,7 @@ class BaseNormalize(abc.ABC):
         raise NotImplementedError("")
 
     @abc.abstractmethod
-    def _get_calendar_list(self):
+    def _get_calendar_list(self) -> Iterable[pd.Timestamp]:
         """Get benchmark calendar"""
         raise NotImplementedError("")
 
@@ -265,6 +252,7 @@ class Normalize:
         max_workers: int = 16,
         date_field_name: str = "date",
         symbol_field_name: str = "symbol",
+        **kwargs,
     ):
         """
 
@@ -288,17 +276,51 @@ class Normalize:
         self._source_dir = Path(source_dir).expanduser()
         self._target_dir = Path(target_dir).expanduser()
         self._target_dir.mkdir(parents=True, exist_ok=True)
-
+        self._date_field_name = date_field_name
+        self._symbol_field_name = symbol_field_name
+        self._end_date = kwargs.get("end_date", None)
         self._max_workers = max_workers
+        self.interval = kwargs.get("interval", "1d")
 
-        self._normalize_obj = normalize_class(date_field_name=date_field_name, symbol_field_name=symbol_field_name)
+        self._normalize_obj = normalize_class(
+            date_field_name=date_field_name, symbol_field_name=symbol_field_name, **kwargs
+        )
+
+    def format_data(self, df: pd.DataFrame):
+        if self.interval == "1d":
+            try:
+                pd.to_datetime(df.iloc[-1]["date"], format="%Y-%m-%d", errors="raise")
+            except Exception:
+                df = df.iloc[:-1]
+        return df
 
     def _executor(self, file_path: Path):
         file_path = Path(file_path)
-        df = pd.read_csv(file_path)
-        df = self._normalize_obj.normalize(df)
+
+        # some symbol_field values such as TRUE, NA are decoded as True(bool), NaN(np.float) by pandas default csv parsing.
+        # manually defines dtype and na_values of the symbol_field.
+        default_na = pd._libs.parsers.STR_NA_VALUES  # pylint: disable=I1101
+        symbol_na = default_na.copy()
+        symbol_na.remove("NA")
+        columns = pd.read_csv(file_path, nrows=0).columns
+        df = pd.read_csv(
+            file_path,
+            dtype={self._symbol_field_name: str},
+            keep_default_na=False,
+            na_values={col: symbol_na if col == self._symbol_field_name else default_na for col in columns},
+        )
+        df = self.format_data(df=df)
+
         if not df.empty:
-            df.to_csv(self._target_dir.joinpath(file_path.name), index=False)
+            # NOTE: It has been reported that there may be some problems here, and the specific issues will be dealt with when they are identified.
+            df = self._normalize_obj.normalize(df)
+            if df is not None and not df.empty:
+                if self._end_date is not None:
+                    _mask = pd.to_datetime(df[self._date_field_name]) <= pd.Timestamp(self._end_date)
+                    df = df[_mask]
+                df.to_csv(self._target_dir.joinpath(file_path.name), index=False)
+        else:
+            logger.warning(f"{file_path.stem} source data is empty and will not undergo normalization processing.")
 
     def normalize(self):
         logger.info("normalize data......")
@@ -311,7 +333,7 @@ class Normalize:
 
 
 class BaseRun(abc.ABC):
-    def __init__(self, source_dir=None, normalize_dir=None, max_workers=4, interval="1d"):
+    def __init__(self, source_dir=None, normalize_dir=None, max_workers=1, interval="1d"):
         """
 
         Parameters
@@ -321,12 +343,12 @@ class BaseRun(abc.ABC):
         normalize_dir: str
             Directory for normalize data, default "Path(__file__).parent/normalize"
         max_workers: int
-            Concurrent number, default is 4
+            Concurrent number, default is 1; Concurrent number, default is 1; when collecting data, it is recommended that max_workers be set to 1
         interval: str
             freq, value from [1min, 1d], default 1d
         """
         if source_dir is None:
-            source_dir = Path(self.default_base_dir).joinpath("_source")
+            source_dir = Path(self.default_base_dir).joinpath("source")
         self.source_dir = Path(source_dir).expanduser().resolve()
         self.source_dir.mkdir(parents=True, exist_ok=True)
 
@@ -342,17 +364,17 @@ class BaseRun(abc.ABC):
     @property
     @abc.abstractmethod
     def collector_class_name(self):
-        raise NotImplementedError("rewrite normalize_symbol")
+        raise NotImplementedError("rewrite collector_class_name")
 
     @property
     @abc.abstractmethod
     def normalize_class_name(self):
-        raise NotImplementedError("rewrite normalize_symbol")
+        raise NotImplementedError("rewrite normalize_class_name")
 
     @property
     @abc.abstractmethod
     def default_base_dir(self) -> [Path, str]:
-        raise NotImplementedError("rewrite normalize_symbol")
+        raise NotImplementedError("rewrite default_base_dir")
 
     def download_data(
         self,
@@ -360,9 +382,9 @@ class BaseRun(abc.ABC):
         delay=0,
         start=None,
         end=None,
-        interval="1d",
-        check_data_length=False,
+        check_data_length: int = None,
         limit_nums=None,
+        **kwargs,
     ):
         """download data from Internet
 
@@ -372,14 +394,12 @@ class BaseRun(abc.ABC):
             default 2
         delay: float
             time.sleep(delay), default 0
-        interval: str
-            freq, value from [1min, 1d], default 1d
         start: str
             start datetime, default "2000-01-01"
         end: str
             end datetime, default ``pd.Timestamp(datetime.datetime.now() + pd.Timedelta(days=1))``
-        check_data_length: bool
-            check data length, by default False
+        check_data_length: int
+            check data length, if not None and greater than 0, each symbol will be considered complete if its data length is greater than or equal to this value, otherwise it will be fetched again, the maximum number of fetches being (max_collector_count). By default None.
         limit_nums: int
             using for debug, by default None
 
@@ -399,12 +419,13 @@ class BaseRun(abc.ABC):
             delay=delay,
             start=start,
             end=end,
-            interval=interval,
+            interval=self.interval,
             check_data_length=check_data_length,
             limit_nums=limit_nums,
+            **kwargs,
         ).collector_data()
 
-    def normalize_data(self, date_field_name: str = "date", symbol_field_name: str = "symbol"):
+    def normalize_data(self, date_field_name: str = "date", symbol_field_name: str = "symbol", **kwargs):
         """normalize data
 
         Parameters
@@ -426,5 +447,6 @@ class BaseRun(abc.ABC):
             max_workers=self.max_workers,
             date_field_name=date_field_name,
             symbol_field_name=symbol_field_name,
+            **kwargs,
         )
         yc.normalize()

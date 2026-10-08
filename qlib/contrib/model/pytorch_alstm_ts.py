@@ -5,7 +5,6 @@
 from __future__ import division
 from __future__ import print_function
 
-import os
 import numpy as np
 import pandas as pd
 from typing import Text, Union
@@ -20,8 +19,10 @@ from torch.utils.data import DataLoader
 
 from .pytorch_utils import count_parameters
 from ...model.base import Model
-from ...data.dataset import DatasetH, TSDatasetH
+from ...data.dataset import DatasetH
 from ...data.dataset.handler import DataHandlerLP
+from ...model.utils import ConcatDataset
+from ...data.dataset.weight import Reweighter
 
 
 class ALSTM(Model):
@@ -32,7 +33,7 @@ class ALSTM(Model):
     d_feat : int
         input dimension for each time step
     metric: str
-        the evaluate metric used in early stop
+        the evaluation metric used in early stop
     optimizer : str
         optimizer name
     GPU : int
@@ -55,7 +56,7 @@ class ALSTM(Model):
         n_jobs=10,
         GPU=0,
         seed=None,
-        **kwargs
+        **kwargs,
     ):
         # Set logger.
         self.logger = get_module_logger("ALSTM")
@@ -139,37 +140,42 @@ class ALSTM(Model):
     def use_gpu(self):
         return self.device != torch.device("cpu")
 
-    def mse(self, pred, label):
-        loss = (pred - label) ** 2
+    def mse(self, pred, label, weight):
+        loss = weight * (pred - label) ** 2
         return torch.mean(loss)
 
-    def loss_fn(self, pred, label):
+    def loss_fn(self, pred, label, weight=None):
         mask = ~torch.isnan(label)
 
+        if weight is None:
+            weight = torch.ones_like(label)
+
         if self.loss == "mse":
-            return self.mse(pred[mask], label[mask])
+            return self.mse(pred[mask], label[mask], weight[mask])
 
         raise ValueError("unknown loss `%s`" % self.loss)
 
     def metric_fn(self, pred, label):
-
         mask = torch.isfinite(label)
 
-        if self.metric == "" or self.metric == "loss":
+        if self.metric in ("", "loss"):
             return -self.loss_fn(pred[mask], label[mask])
+        elif self.metric == "mse":
+            mask = ~torch.isnan(label)
+            weight = torch.ones_like(label)
+            return -self.mse(pred[mask], label[mask], weight[mask])
 
         raise ValueError("unknown metric `%s`" % self.metric)
 
     def train_epoch(self, data_loader):
-
         self.ALSTM_model.train()
 
-        for data in data_loader:
+        for data, weight in data_loader:
             feature = data[:, :, 0:-1].to(self.device)
             label = data[:, -1, -1].to(self.device)
 
             pred = self.ALSTM_model(feature.float())
-            loss = self.loss_fn(pred, label)
+            loss = self.loss_fn(pred, label, weight.to(self.device))
 
             self.train_optimizer.zero_grad()
             loss.backward()
@@ -177,21 +183,19 @@ class ALSTM(Model):
             self.train_optimizer.step()
 
     def test_epoch(self, data_loader):
-
         self.ALSTM_model.eval()
 
         scores = []
         losses = []
 
-        for data in data_loader:
-
+        for data, weight in data_loader:
             feature = data[:, :, 0:-1].to(self.device)
             # feature[torch.isnan(feature)] = 0
             label = data[:, -1, -1].to(self.device)
 
             with torch.no_grad():
                 pred = self.ALSTM_model(feature.float())
-                loss = self.loss_fn(pred, label)
+                loss = self.loss_fn(pred, label, weight.to(self.device))
                 losses.append(loss.item())
 
                 score = self.metric_fn(pred, label)
@@ -204,18 +208,38 @@ class ALSTM(Model):
         dataset,
         evals_result=dict(),
         save_path=None,
+        reweighter=None,
     ):
         dl_train = dataset.prepare("train", col_set=["feature", "label"], data_key=DataHandlerLP.DK_L)
         dl_valid = dataset.prepare("valid", col_set=["feature", "label"], data_key=DataHandlerLP.DK_L)
+        if dl_train.empty or dl_valid.empty:
+            raise ValueError("Empty data from dataset, please check your dataset config.")
 
         dl_train.config(fillna_type="ffill+bfill")  # process nan brought by dataloader
         dl_valid.config(fillna_type="ffill+bfill")  # process nan brought by dataloader
 
+        if reweighter is None:
+            wl_train = np.ones(len(dl_train))
+            wl_valid = np.ones(len(dl_valid))
+        elif isinstance(reweighter, Reweighter):
+            wl_train = reweighter.reweight(dl_train)
+            wl_valid = reweighter.reweight(dl_valid)
+        else:
+            raise ValueError("Unsupported reweighter type.")
+
         train_loader = DataLoader(
-            dl_train, batch_size=self.batch_size, shuffle=True, num_workers=self.n_jobs, drop_last=True
+            ConcatDataset(dl_train, wl_train),
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.n_jobs,
+            drop_last=True,
         )
         valid_loader = DataLoader(
-            dl_valid, batch_size=self.batch_size, shuffle=False, num_workers=self.n_jobs, drop_last=True
+            ConcatDataset(dl_valid, wl_valid),
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.n_jobs,
+            drop_last=True,
         )
 
         save_path = get_or_create_path(save_path)
@@ -271,7 +295,6 @@ class ALSTM(Model):
         preds = []
 
         for data in test_loader:
-
             feature = data[:, :, 0:-1].to(self.device)
 
             with torch.no_grad():
@@ -295,8 +318,8 @@ class ALSTMModel(nn.Module):
     def _build_model(self):
         try:
             klass = getattr(nn, self.rnn_type.upper())
-        except:
-            raise ValueError("unknown rnn_type `%s`" % self.rnn_type)
+        except Exception as e:
+            raise ValueError("unknown rnn_type `%s`" % self.rnn_type) from e
         self.net = nn.Sequential()
         self.net.add_module("fc_in", nn.Linear(in_features=self.input_size, out_features=self.hid_size))
         self.net.add_module("act", nn.Tanh())

@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 
 from qlib.config import C
+from qlib.utils.pickle_utils import restricted_pickle_load
 
 
 class ObjManager:
@@ -101,12 +102,14 @@ class FileManager(ObjManager):
     def create_path(self) -> str:
         try:
             return tempfile.mkdtemp(prefix=str(C["file_manager_path"]) + os.sep)
-        except AttributeError:
-            raise NotImplementedError(f"If path is not given, the `create_path` function should be implemented")
+        except AttributeError as attribute_e:
+            raise NotImplementedError(
+                f"If path is not given, the `create_path` function should be implemented"
+            ) from attribute_e
 
     def save_obj(self, obj, name):
         with (self.path / name).open("wb") as f:
-            pickle.dump(obj, f)
+            pickle.dump(obj, f, protocol=C.dump_protocol_version)
 
     def save_objs(self, obj_name_l):
         for obj, name in obj_name_l:
@@ -114,7 +117,7 @@ class FileManager(ObjManager):
 
     def load_obj(self, name):
         with (self.path / name).open("rb") as f:
-            return pickle.load(f)
+            return restricted_pickle_load(f)
 
     def exists(self, name):
         return (self.path / name).exists()

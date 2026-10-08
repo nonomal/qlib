@@ -4,6 +4,7 @@
 import pandas as pd
 
 from ..graph import ScatterGraph
+from ..utils import guess_plotly_rangebreaks
 
 
 def _get_score_ic(pred_label: pd.DataFrame):
@@ -14,12 +15,14 @@ def _get_score_ic(pred_label: pd.DataFrame):
     """
     concat_data = pred_label.copy()
     concat_data.dropna(axis=0, how="any", inplace=True)
-    _ic = concat_data.groupby(level="datetime").apply(lambda x: x["label"].corr(x["score"]))
-    _rank_ic = concat_data.groupby(level="datetime").apply(lambda x: x["label"].corr(x["score"], method="spearman"))
+    _ic = concat_data.groupby(level="datetime", group_keys=False).apply(lambda x: x["label"].corr(x["score"]))
+    _rank_ic = concat_data.groupby(level="datetime", group_keys=False).apply(
+        lambda x: x["label"].corr(x["score"], method="spearman")
+    )
     return pd.DataFrame({"ic": _ic, "rank_ic": _rank_ic})
 
 
-def score_ic_graph(pred_label: pd.DataFrame, show_notebook: bool = True) -> [list, tuple]:
+def score_ic_graph(pred_label: pd.DataFrame, show_notebook: bool = True, **kwargs) -> [list, tuple]:
     """score IC
 
         Example:
@@ -53,11 +56,13 @@ def score_ic_graph(pred_label: pd.DataFrame, show_notebook: bool = True) -> [lis
     :return: if show_notebook is True, display in notebook; else return **plotly.graph_objs.Figure** list.
     """
     _ic_df = _get_score_ic(pred_label)
-    # FIXME: support HIGH-FREQ
-    _ic_df.index = _ic_df.index.strftime("%Y-%m-%d")
+
     _figure = ScatterGraph(
         _ic_df,
-        layout=dict(title="Score IC", xaxis=dict(type="category", tickangle=45)),
+        layout=dict(
+            title="Score IC",
+            xaxis=dict(tickangle=45, rangebreaks=kwargs.get("rangebreaks", guess_plotly_rangebreaks(_ic_df.index))),
+        ),
         graph_kwargs={"mode": "lines+markers"},
     ).figure
     if show_notebook:

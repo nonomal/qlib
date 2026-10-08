@@ -2,32 +2,76 @@
 # Licensed under the MIT License.
 
 # coding=utf-8
-import abc
-import bisect
-import logging
+from abc import abstractmethod
 import warnings
-from inspect import getfullargspec
 from typing import Callable, Union, Tuple, List, Iterator, Optional
 
 import pandas as pd
-import numpy as np
 
+from qlib.typehint import Literal
 from ...log import get_module_logger, TimeInspector
-from ...data import D
-from ...config import C
-from ...utils import parse_config, transform_end_date, init_instance_by_config
+from ...utils import init_instance_by_config
 from ...utils.serial import Serializable
-from .utils import fetch_df_by_index
-from pathlib import Path
+from .utils import fetch_df_by_index, fetch_df_by_col
+from ...utils import lazy_sort_index
 from .loader import DataLoader
 
 from . import processor as processor_module
 from . import loader as data_loader_module
 
+DATA_KEY_TYPE = Literal["raw", "infer", "learn"]
 
-# TODO: A more general handler interface which does not relies on internal pd.DataFrame is needed.
-class DataHandler(Serializable):
+
+class DataHandlerABC(Serializable):
     """
+    Interface for data handler.
+
+    This class does not assume the internal data structure of the data handler.
+    It only defines the interface for external users (uses DataFrame as the internal data structure).
+
+    In the future, the data handler's more detailed implementation should be refactored. Here are some guidelines:
+
+    It covers several components:
+
+    - [data loader] -> internal representation of the data -> data preprocessing -> interface adaptor for the fetch interface
+    - The workflow to combine them all:
+      The workflow may be very complicated. DataHandlerLP is one of the practices, but it can't satisfy all the requirements.
+      So leaving the flexibility to the user to implement the workflow is a more reasonable choice.
+    """
+
+    def __init__(self, *args, **kwargs):  # pylint: disable=W0246
+        """
+        We should define how to get ready for the fetching.
+        """
+        super().__init__(*args, **kwargs)
+
+    CS_ALL = "__all"  # return all columns with single-level index column
+    CS_RAW = "__raw"  # return raw data with multi-level index column
+
+    # data key
+    DK_R: DATA_KEY_TYPE = "raw"
+    DK_I: DATA_KEY_TYPE = "infer"
+    DK_L: DATA_KEY_TYPE = "learn"
+
+    @abstractmethod
+    def fetch(
+        self,
+        selector: Union[pd.Timestamp, slice, str, pd.Index] = slice(None, None),
+        level: Union[str, int] = "datetime",
+        col_set: Union[str, List[str]] = CS_ALL,
+        data_key: DATA_KEY_TYPE = DK_I,
+    ) -> pd.DataFrame:
+        pass
+
+
+class DataHandler(DataHandlerABC):
+    """
+    The motivation of DataHandler:
+
+    - It provides an implementation of BaseDataHandler that we implement with:
+        - Handling responses with an internal loaded DataFrame
+        - The DataFrame is loaded by a data loader.
+
     The steps to using a handler
     1. initialized data handler  (call by `init`).
     2. use the data.
@@ -42,7 +86,7 @@ class DataHandler(Serializable):
     Example of the data:
     The multi-index of the columns is optional.
 
-    .. code-block:: python
+    .. code-block:: text
 
                                 feature                                                            label
                                 $close     $volume  Ref($close, 1)  Mean($close, 3)  $high-$low  LABEL0
@@ -55,6 +99,8 @@ class DataHandler(Serializable):
     Tips for improving the performance of datahandler
     - Fetching data with `col_set=CS_RAW` will return the raw data and may avoid pandas from copying the data when calling `loc`
     """
+
+    _data: pd.DataFrame  # underlying data.
 
     def __init__(
         self,
@@ -69,7 +115,7 @@ class DataHandler(Serializable):
         Parameters
         ----------
         instruments :
-            The stock list to retrive.
+            The stock list to retrieve.
         start_time :
             start_time of the original data.
         end_time :
@@ -81,8 +127,6 @@ class DataHandler(Serializable):
         fetch_orig : bool
             Return the original data instead of copy if possible.
         """
-        # Set logger
-        self.logger = get_module_logger("DataHandler")
 
         # Setup data loader
         assert data_loader is not None  # to make start_time end_time could have None default value
@@ -146,52 +190,67 @@ class DataHandler(Serializable):
         # Setup data.
         # _data may be with multiple column index level. The outer level indicates the feature set name
         with TimeInspector.logt("Loading data"):
-            self._data = self.data_loader.load(self.instruments, self.start_time, self.end_time)
+            # make sure the fetch method is based on an index-sorted pd.DataFrame
+            self._data = lazy_sort_index(self.data_loader.load(self.instruments, self.start_time, self.end_time))
         # TODO: cache
-
-    CS_ALL = "__all"  # return all columns with single-level index column
-    CS_RAW = "__raw"  # return raw data with multi-level index column
-
-    def _fetch_df_by_col(self, df: pd.DataFrame, col_set: str) -> pd.DataFrame:
-        if not isinstance(df.columns, pd.MultiIndex) or col_set == self.CS_RAW:
-            return df
-        elif col_set == self.CS_ALL:
-            return df.droplevel(axis=1, level=0)
-        else:
-            return df.loc(axis=1)[col_set]
 
     def fetch(
         self,
-        selector: Union[pd.Timestamp, slice, str] = slice(None, None),
+        selector: Union[pd.Timestamp, slice, str, pd.Index] = slice(None, None),
         level: Union[str, int] = "datetime",
-        col_set: Union[str, List[str]] = CS_ALL,
+        col_set: Union[str, List[str]] = DataHandlerABC.CS_ALL,
+        data_key: DATA_KEY_TYPE = DataHandlerABC.DK_I,
         squeeze: bool = False,
-        proc_func: Callable = None,
+        proc_func: Optional[Callable] = None,
     ) -> pd.DataFrame:
         """
         fetch data from underlying data source
+
+        Design motivation:
+        - providing a unified interface for underlying data.
+        - Potential to make the interface more friendly.
+        - User can improve performance when fetching data in this extra layer
 
         Parameters
         ----------
         selector : Union[pd.Timestamp, slice, str]
             describe how to select data by index
+            It can be categories as following
+
+            - fetch single index
+            - fetch a range of index
+
+                - a slice range
+                - pd.Index for specific indexes
+
+            Following conflicts may occur
+
+            - Does ["20200101", "20210101"] mean selecting this slice or these two days?
+
+                - slice have higher priorities
+
         level : Union[str, int]
             which index level to select the data
+
         col_set : Union[str, List[str]]
 
             - if isinstance(col_set, str):
 
-                select a set of meaningful columns.(e.g. features, columns)
+                select a set of meaningful, pd.Index columns.(e.g. features, columns)
 
-                if cal_set == CS_RAW:
+                - if col_set == CS_RAW:
+
                     the raw dataset will be returned.
 
             - if isinstance(col_set, List[str]):
 
                 select several sets of meaningful columns, the returned data has multiple levels
+
         proc_func: Callable
+
             - Give a hook for processing data before fetching
             - An example to explain the necessity of the hook:
+
                 - A Dataset learned some processors to process data which is related to data segmentation
                 - It will apply them every time when preparing data.
                 - The learned processor require the dataframe remains the same format when fitting and applying
@@ -205,25 +264,68 @@ class DataHandler(Serializable):
         -------
         pd.DataFrame.
         """
-        if proc_func is None:
-            df = self._data
-        else:
-            # FIXME: fetching by time first will be more friendly to `proc_func`
-            # Copy in case of `proc_func` changing the data inplace....
-            df = proc_func(fetch_df_by_index(self._data, selector, level, fetch_orig=self.fetch_orig).copy())
+        # DataHandler is an example with only one dataframe, so data_key is not used.
+        _ = data_key  # avoid linting errors (e.g., unused-argument)
+        return self._fetch_data(
+            data_storage=self._data,
+            selector=selector,
+            level=level,
+            col_set=col_set,
+            squeeze=squeeze,
+            proc_func=proc_func,
+        )
 
-        # Fetch column  first will be more friendly to SepDataFrame
-        df = self._fetch_df_by_col(df, col_set)
-        df = fetch_df_by_index(df, selector, level, fetch_orig=self.fetch_orig)
+    def _fetch_data(
+        self,
+        data_storage,
+        selector: Union[pd.Timestamp, slice, str, pd.Index] = slice(None, None),
+        level: Union[str, int] = "datetime",
+        col_set: Union[str, List[str]] = DataHandlerABC.CS_ALL,
+        squeeze: bool = False,
+        proc_func: Callable = None,
+    ):
+        # This method is extracted for sharing in subclasses
+        from .storage import BaseHandlerStorage  # pylint: disable=C0415
+
+        # Following conflicts may occur
+        # - Does [20200101", "20210101"] mean selecting this slice or these two days?
+        # To solve this issue
+        #   - slice have higher priorities (except when level is none)
+        if isinstance(selector, (tuple, list)) and level is not None:
+            # when level is None, the argument will be passed in directly
+            # we don't have to convert it into slice
+            try:
+                selector = slice(*selector)
+            except ValueError:
+                get_module_logger("DataHandlerLP").info(f"Fail to converting to query to slice. It will used directly")
+
+        if isinstance(data_storage, pd.DataFrame):
+            data_df = data_storage
+            if proc_func is not None:
+                # FIXME: fetching by time first will be more friendly to `proc_func`
+                # Copy in case of `proc_func` changing the data inplace....
+                data_df = proc_func(fetch_df_by_index(data_df, selector, level, fetch_orig=self.fetch_orig).copy())
+                data_df = fetch_df_by_col(data_df, col_set)
+            else:
+                # Fetch column  first will be more friendly to SepDataFrame
+                data_df = fetch_df_by_col(data_df, col_set)
+                data_df = fetch_df_by_index(data_df, selector, level, fetch_orig=self.fetch_orig)
+        elif isinstance(data_storage, BaseHandlerStorage):
+            if proc_func is not None:
+                raise ValueError(f"proc_func is not supported by the storage {type(data_storage)}")
+            data_df = data_storage.fetch(selector=selector, level=level, col_set=col_set, fetch_orig=self.fetch_orig)
+        else:
+            raise TypeError(f"data_storage should be pd.DataFrame|HashingStockStorage, not {type(data_storage)}")
+
         if squeeze:
             # squeeze columns
-            df = df.squeeze()
+            data_df = data_df.squeeze()
             # squeeze index
             if isinstance(selector, (str, pd.Timestamp)):
-                df = df.reset_index(level=level, drop=True)
-        return df
+                data_df = data_df.reset_index(level=level, drop=True)
+        return data_df
 
-    def get_cols(self, col_set=CS_ALL) -> list:
+    def get_cols(self, col_set=DataHandlerABC.CS_ALL) -> list:
         """
         get the column names
 
@@ -238,7 +340,7 @@ class DataHandler(Serializable):
             list of column names
         """
         df = self._data.head()
-        df = self._fetch_df_by_col(df, col_set)
+        df = fetch_df_by_col(df, col_set)
         return df.columns.to_list()
 
     def get_range_selector(self, cur_date: Union[pd.Timestamp, str], periods: int) -> slice:
@@ -262,7 +364,7 @@ class DataHandler(Serializable):
         self, periods: int, min_periods: Optional[int] = None, **kwargs
     ) -> Iterator[Tuple[pd.Timestamp, pd.DataFrame]]:
         """
-        get a iterator of sliced data with given periods
+        get an iterator of sliced data with given periods
 
         Args:
             periods (int): number of periods.
@@ -279,25 +381,56 @@ class DataHandler(Serializable):
 
 class DataHandlerLP(DataHandler):
     """
+    Motivation:
+    - For the case that we hope using different processor workflows for learning and inference;
+
+
     DataHandler with **(L)earnable (P)rocessor**
 
-    Tips to improving the performance of data handler
+    This handler will produce three pieces of data in pd.DataFrame format.
+
+    - DK_R / self._data: the raw data loaded from the loader
+    - DK_I / self._infer: the data processed for inference
+    - DK_L / self._learn: the data processed for learning model.
+
+    The motivation of using different processor workflows for learning and inference
+    Here are some examples.
+
+    - The instrument universe for learning and inference may be different.
+    - The processing of some samples may rely on label (for example, some samples hit the limit may need extra processing or be dropped).
+
+        - These processors only apply to the learning phase.
+
+    Tips for data handler
+
     - To reduce the memory cost
+
         - `drop_raw=True`: this will modify the data inplace on raw data;
+
+    - Please note processed data like `self._infer` or `self._learn` are concepts different from `segments` in Qlib's `Dataset` like "train" and "test"
+
+        - Processed data like `self._infer` or `self._learn` are underlying data processed with different processors
+        - `segments` in Qlib's `Dataset` like "train" and "test" are simply the time segmentations when querying data("train" are often before "test" in time-series).
+        - For example, you can query `data._infer` processed by `infer_processors` in the "train" time segmentation.
     """
 
-    # data key
-    DK_R = "raw"
-    DK_I = "infer"
-    DK_L = "learn"
+    # based on `self._data`, _infer and _learn are genrated after processors
+    _infer: pd.DataFrame  # data for inference
+    _learn: pd.DataFrame  # data for learning models
+
+    # map data_key to attribute name
+    ATTR_MAP = {DataHandler.DK_R: "_data", DataHandler.DK_I: "_infer", DataHandler.DK_L: "_learn"}
 
     # process type
     PTYPE_I = "independent"
-    # - self._infer will be processed by infer_processors
-    # - self._learn will be processed by learn_processors
+    # - self._infer will be processed by shared_processors + infer_processors
+    # - self._learn will be processed by shared_processors + learn_processors
+
+    # NOTE:
     PTYPE_A = "append"
-    # - self._infer will be processed by infer_processors
-    # - self._learn will be processed by infer_processors + learn_processors
+
+    # - self._infer will be processed by shared_processors + infer_processors
+    # - self._learn will be processed by shared_processors + infer_processors + learn_processors
     #   - (e.g. self._infer processed by learn_processors )
 
     def __init__(
@@ -306,8 +439,9 @@ class DataHandlerLP(DataHandler):
         start_time=None,
         end_time=None,
         data_loader: Union[dict, str, DataLoader] = None,
-        infer_processors=[],
-        learn_processors=[],
+        infer_processors: List = [],
+        learn_processors: List = [],
+        shared_processors: List = [],
         process_type=PTYPE_A,
         drop_raw=False,
         **kwargs,
@@ -340,13 +474,13 @@ class DataHandlerLP(DataHandler):
         process_type: str
             PTYPE_I = 'independent'
 
-            - self._infer will processed by infer_processors
+            - self._infer will be processed by infer_processors
 
             - self._learn will be processed by learn_processors
 
             PTYPE_A = 'append'
 
-            - self._infer will processed by infer_processors
+            - self._infer will be processed by infer_processors
 
             - self._learn will be processed by infer_processors + learn_processors
 
@@ -358,7 +492,8 @@ class DataHandlerLP(DataHandler):
         # Setup preprocessor
         self.infer_processors = []  # for lint
         self.learn_processors = []  # for lint
-        for pname in "infer_processors", "learn_processors":
+        self.shared_processors = []  # for lint
+        for pname in "infer_processors", "learn_processors", "shared_processors":
             for proc in locals()[pname]:
                 getattr(self, pname).append(
                     init_instance_by_config(
@@ -373,9 +508,12 @@ class DataHandlerLP(DataHandler):
         super().__init__(instruments, start_time, end_time, data_loader, **kwargs)
 
     def get_all_processors(self):
-        return self.infer_processors + self.learn_processors
+        return self.shared_processors + self.infer_processors + self.learn_processors
 
     def fit(self):
+        """
+        fit data without processing the data
+        """
         for proc in self.get_all_processors():
             with TimeInspector.logt(f"{proc.__class__.__name__}"):
                 proc.fit(self._data)
@@ -388,45 +526,86 @@ class DataHandlerLP(DataHandler):
         """
         self.process_data(with_fit=True)
 
+    @staticmethod
+    def _run_proc_l(
+        df: pd.DataFrame, proc_l: List[processor_module.Processor], with_fit: bool, check_for_infer: bool
+    ) -> pd.DataFrame:
+        for proc in proc_l:
+            if check_for_infer and not proc.is_for_infer():
+                raise TypeError("Only processors usable for inference can be used in `infer_processors` ")
+            with TimeInspector.logt(f"{proc.__class__.__name__}"):
+                if with_fit:
+                    proc.fit(df)
+                df = proc(df)
+        return df
+
+    @staticmethod
+    def _is_proc_readonly(proc_l: List[processor_module.Processor]):
+        """
+        NOTE: it will return True if `len(proc_l) == 0`
+        """
+        for p in proc_l:
+            if not p.readonly():
+                return False
+        return True
+
     def process_data(self, with_fit: bool = False):
         """
         process_data data. Fun `processor.fit` if necessary
+
+        Notation: (data)  [processor]
+
+        # data processing flow of self.process_type == DataHandlerLP.PTYPE_I
+
+        .. code-block:: text
+
+            (self._data)-[shared_processors]-(_shared_df)-[learn_processors]-(_learn_df)
+                                                   \\
+                                                    -[infer_processors]-(_infer_df)
+
+        # data processing flow of self.process_type == DataHandlerLP.PTYPE_A
+
+        .. code-block:: text
+
+            (self._data)-[shared_processors]-(_shared_df)-[infer_processors]-(_infer_df)-[learn_processors]-(_learn_df)
 
         Parameters
         ----------
         with_fit : bool
             The input of the `fit` will be the output of the previous processor
         """
-        # data for inference
-        _infer_df = self._data
-        if len(self.infer_processors) > 0 and not self.drop_raw:  # avoid modifying the original  data
-            _infer_df = _infer_df.copy()
+        # shared data processors
+        # 1) assign
+        _shared_df = self._data
+        if not self._is_proc_readonly(self.shared_processors):  # avoid modifying the original data
+            _shared_df = _shared_df.copy()
+        # 2) process
+        _shared_df = self._run_proc_l(_shared_df, self.shared_processors, with_fit=with_fit, check_for_infer=True)
 
-        for proc in self.infer_processors:
-            if not proc.is_for_infer():
-                raise TypeError("Only processors usable for inference can be used in `infer_processors` ")
-            with TimeInspector.logt(f"{proc.__class__.__name__}"):
-                if with_fit:
-                    proc.fit(_infer_df)
-                _infer_df = proc(_infer_df)
+        # data for inference
+        # 1) assign
+        _infer_df = _shared_df
+        if not self._is_proc_readonly(self.infer_processors):  # avoid modifying the original data
+            _infer_df = _infer_df.copy()
+        # 2) process
+        _infer_df = self._run_proc_l(_infer_df, self.infer_processors, with_fit=with_fit, check_for_infer=True)
+
         self._infer = _infer_df
 
         # data for learning
+        # 1) assign
         if self.process_type == DataHandlerLP.PTYPE_I:
-            _learn_df = self._data
+            _learn_df = _shared_df
         elif self.process_type == DataHandlerLP.PTYPE_A:
             # based on `infer_df` and append the processor
             _learn_df = _infer_df
         else:
             raise NotImplementedError(f"This type of input is not supported")
-
-        if len(self.learn_processors) > 0:  # avoid modifying the original  data
+        if not self._is_proc_readonly(self.learn_processors):  # avoid modifying the original  data
             _learn_df = _learn_df.copy()
-        for proc in self.learn_processors:
-            with TimeInspector.logt(f"{proc.__class__.__name__}"):
-                if with_fit:
-                    proc.fit(_learn_df)
-                _learn_df = proc(_learn_df)
+        # 2) process
+        _learn_df = self._run_proc_l(_learn_df, self.learn_processors, with_fit=with_fit, check_for_infer=False)
+
         self._learn = _learn_df
 
         if self.drop_raw:
@@ -483,12 +662,12 @@ class DataHandlerLP(DataHandler):
 
         # TODO: Be able to cache handler data. Save the memory for data processing
 
-    def _get_df_by_key(self, data_key: str = DK_I) -> pd.DataFrame:
+    def _get_df_by_key(self, data_key: DATA_KEY_TYPE = DataHandlerABC.DK_I) -> pd.DataFrame:
         if data_key == self.DK_R and self.drop_raw:
             raise AttributeError(
                 "DataHandlerLP has not attribute _data, please set drop_raw = False if you want to use raw data"
             )
-        df = getattr(self, {self.DK_R: "_data", self.DK_I: "_infer", self.DK_L: "_learn"}[data_key])
+        df = getattr(self, self.ATTR_MAP[data_key])
         return df
 
     def fetch(
@@ -496,7 +675,8 @@ class DataHandlerLP(DataHandler):
         selector: Union[pd.Timestamp, slice, str] = slice(None, None),
         level: Union[str, int] = "datetime",
         col_set=DataHandler.CS_ALL,
-        data_key: str = DK_I,
+        data_key: DATA_KEY_TYPE = DataHandler.DK_I,
+        squeeze: bool = False,
         proc_func: Callable = None,
     ) -> pd.DataFrame:
         """
@@ -519,16 +699,17 @@ class DataHandlerLP(DataHandler):
         -------
         pd.DataFrame:
         """
-        df = self._get_df_by_key(data_key)
-        if proc_func is not None:
-            # FIXME: fetch by time first will be more friendly to proc_func
-            # Copy incase of `proc_func` changing the data inplace....
-            df = proc_func(fetch_df_by_index(df, selector, level, fetch_orig=self.fetch_orig).copy())
-        # Fetch column  first will be more friendly to SepDataFrame
-        df = self._fetch_df_by_col(df, col_set)
-        return fetch_df_by_index(df, selector, level, fetch_orig=self.fetch_orig)
 
-    def get_cols(self, col_set=DataHandler.CS_ALL, data_key: str = DK_I) -> list:
+        return self._fetch_data(
+            data_storage=self._get_df_by_key(data_key),
+            selector=selector,
+            level=level,
+            col_set=col_set,
+            squeeze=squeeze,
+            proc_func=proc_func,
+        )
+
+    def get_cols(self, col_set=DataHandler.CS_ALL, data_key: DATA_KEY_TYPE = DataHandlerABC.DK_I) -> list:
         """
         get the column names
 
@@ -536,7 +717,7 @@ class DataHandlerLP(DataHandler):
         ----------
         col_set : str
             select a set of meaningful columns.(e.g. features, columns).
-        data_key : str
+        data_key : DATA_KEY_TYPE
             the data to fetch:  DK_*.
 
         Returns
@@ -545,5 +726,60 @@ class DataHandlerLP(DataHandler):
             list of column names
         """
         df = self._get_df_by_key(data_key).head()
-        df = self._fetch_df_by_col(df, col_set)
+        df = fetch_df_by_col(df, col_set)
         return df.columns.to_list()
+
+    @classmethod
+    def cast(cls, handler: "DataHandlerLP") -> "DataHandlerLP":
+        """
+        Motivation
+
+        - A user creates a datahandler in his customized package. Then he wants to share the processed handler to
+          other users without introduce the package dependency and complicated data processing logic.
+        - This class make it possible by casting the class to DataHandlerLP and only keep the processed data
+
+        Parameters
+        ----------
+        handler : DataHandlerLP
+            A subclass of DataHandlerLP
+
+        Returns
+        -------
+        DataHandlerLP:
+            the converted processed data
+        """
+        new_hd: DataHandlerLP = object.__new__(DataHandlerLP)
+        new_hd.from_cast = True  # add a mark for the cast instance
+
+        for key in list(DataHandlerLP.ATTR_MAP.values()) + [
+            "instruments",
+            "start_time",
+            "end_time",
+            "fetch_orig",
+            "drop_raw",
+        ]:
+            setattr(new_hd, key, getattr(handler, key, None))
+        return new_hd
+
+    @classmethod
+    def from_df(cls, df: pd.DataFrame) -> "DataHandlerLP":
+        """
+        Motivation:
+        - When user want to get a quick data handler.
+
+        The created data handler will have only one shared Dataframe without processors.
+        After creating the handler, user may often want to dump the handler for reuse
+        Here is a typical use case
+
+        .. code-block:: python
+
+            from qlib.data.dataset import DataHandlerLP
+            dh = DataHandlerLP.from_df(df)
+            dh.to_pickle(fname, dump_all=True)
+
+        TODO:
+        - The StaticDataLoader is quite slow. It don't have to copy the data again...
+
+        """
+        loader = data_loader_module.StaticDataLoader(df)
+        return cls(data_loader=loader)

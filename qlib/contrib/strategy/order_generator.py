@@ -4,8 +4,10 @@
 """
 This order generator is for strategies based on WeightStrategyBase
 """
-from ..backtest.position import Position
-from ..backtest.exchange import Exchange
+
+from ...backtest.position import Position
+from ...backtest.exchange import Exchange
+
 import pandas as pd
 import copy
 
@@ -17,8 +19,10 @@ class OrderGenerator:
         trade_exchange: Exchange,
         target_weight_position: dict,
         risk_degree: float,
-        pred_date: pd.Timestamp,
-        trade_date: pd.Timestamp,
+        pred_start_time: pd.Timestamp,
+        pred_end_time: pd.Timestamp,
+        trade_start_time: pd.Timestamp,
+        trade_end_time: pd.Timestamp,
     ) -> list:
         """generate_order_list_from_target_weight_position
 
@@ -30,10 +34,14 @@ class OrderGenerator:
         :type target_weight_position: dict
         :param risk_degree:
         :type risk_degree: float
-        :param pred_date: the date the score is predicted
-        :type pred_date: pd.Timestamp
-        :param trade_date: the date the stock is traded
-        :type trade_date: pd.Timestamp
+        :param pred_start_time:
+        :type pred_start_time: pd.Timestamp
+        :param pred_end_time:
+        :type pred_end_time: pd.Timestamp
+        :param trade_start_time:
+        :type trade_start_time: pd.Timestamp
+        :param trade_end_time:
+        :type trade_end_time: pd.Timestamp
 
         :rtype: list
         """
@@ -49,8 +57,10 @@ class OrderGenWInteract(OrderGenerator):
         trade_exchange: Exchange,
         target_weight_position: dict,
         risk_degree: float,
-        pred_date: pd.Timestamp,
-        trade_date: pd.Timestamp,
+        pred_start_time: pd.Timestamp,
+        pred_end_time: pd.Timestamp,
+        trade_start_time: pd.Timestamp,
+        trade_end_time: pd.Timestamp,
     ) -> list:
         """generate_order_list_from_target_weight_position
 
@@ -67,20 +77,34 @@ class OrderGenWInteract(OrderGenerator):
         :type target_weight_position: dict
         :param risk_degree:
         :type risk_degree: float
-        :param pred_date:
-        :type pred_date: pd.Timestamp
-        :param trade_date:
-        :type trade_date: pd.Timestamp
+        :param pred_start_time:
+        :type pred_start_time: pd.Timestamp
+        :param pred_end_time:
+        :type pred_end_time: pd.Timestamp
+        :param trade_start_time:
+        :type trade_start_time: pd.Timestamp
+        :param trade_end_time:
+        :type trade_end_time: pd.Timestamp
 
         :rtype: list
         """
+        if target_weight_position is None:
+            return []
+
         # calculate current_tradable_value
         current_amount_dict = current.get_stock_amount_dict()
+
         current_total_value = trade_exchange.calculate_amount_position_value(
-            amount_dict=current_amount_dict, trade_date=trade_date, only_tradable=False
+            amount_dict=current_amount_dict,
+            start_time=trade_start_time,
+            end_time=trade_end_time,
+            only_tradable=False,
         )
         current_tradable_value = trade_exchange.calculate_amount_position_value(
-            amount_dict=current_amount_dict, trade_date=trade_date, only_tradable=True
+            amount_dict=current_amount_dict,
+            start_time=trade_start_time,
+            end_time=trade_end_time,
+            only_tradable=True,
         )
         # add cash
         current_tradable_value += current.get_cash()
@@ -93,7 +117,7 @@ class OrderGenWInteract(OrderGenerator):
             # value. Then just sell all the stocks
             target_amount_dict = copy.deepcopy(current_amount_dict.copy())
             for stock_id in list(target_amount_dict.keys()):
-                if trade_exchange.is_stock_tradable(stock_id, trade_date):
+                if trade_exchange.is_stock_tradable(stock_id, start_time=trade_start_time, end_time=trade_end_time):
                     del target_amount_dict[stock_id]
         else:
             # consider cost rate
@@ -104,12 +128,14 @@ class OrderGenWInteract(OrderGenerator):
             target_amount_dict = trade_exchange.generate_amount_position_from_weight_position(
                 weight_position=target_weight_position,
                 cash=current_tradable_value,
-                trade_date=trade_date,
+                start_time=trade_start_time,
+                end_time=trade_end_time,
             )
         order_list = trade_exchange.generate_order_for_target_amount_position(
             target_position=target_amount_dict,
             current_position=current_amount_dict,
-            trade_date=trade_date,
+            start_time=trade_start_time,
+            end_time=trade_end_time,
         )
         return order_list
 
@@ -123,14 +149,19 @@ class OrderGenWOInteract(OrderGenerator):
         trade_exchange: Exchange,
         target_weight_position: dict,
         risk_degree: float,
-        pred_date: pd.Timestamp,
-        trade_date: pd.Timestamp,
+        pred_start_time: pd.Timestamp,
+        pred_end_time: pd.Timestamp,
+        trade_start_time: pd.Timestamp,
+        trade_end_time: pd.Timestamp,
     ) -> list:
         """generate_order_list_from_target_weight_position
 
-        generate order list directly not using the information (e.g. whether can be traded, the accurate trade price) at trade date.
-        In target weight position, generating order list need to know the price of objective stock in trade date, but we cannot get that
-        value when do not interact with exchange, so we check the %close price at pred_date or price recorded in current position.
+        generate order list directly not using the information (e.g. whether can be traded, the accurate trade price)
+         at trade date.
+        In target weight position, generating order list need to know the price of objective stock in trade date,
+        but we cannot get that
+        value when do not interact with exchange, so we check the %close price at pred_date or price recorded
+        in current position.
 
         :param current:
         :type current: Position
@@ -140,23 +171,39 @@ class OrderGenWOInteract(OrderGenerator):
         :type target_weight_position: dict
         :param risk_degree:
         :type risk_degree: float
-        :param pred_date:
-        :type pred_date: pd.Timestamp
-        :param trade_date:
-        :type trade_date: pd.Timestamp
+        :param pred_start_time:
+        :type pred_start_time: pd.Timestamp
+        :param pred_end_time:
+        :type pred_end_time: pd.Timestamp
+        :param trade_start_time:
+        :type trade_start_time: pd.Timestamp
+        :param trade_end_time:
+        :type trade_end_time: pd.Timestamp
 
-        :rtype: list
+        :rtype: list of generated orders
         """
+        if target_weight_position is None:
+            return []
+
         risk_total_value = risk_degree * current.calculate_value()
 
         current_stock = current.get_stock_list()
         amount_dict = {}
         for stock_id in target_weight_position:
             # Current rule will ignore the stock that not hold and cannot be traded at predict date
-            if trade_exchange.is_stock_tradable(stock_id=stock_id, trade_date=pred_date):
+            if trade_exchange.is_stock_tradable(
+                stock_id=stock_id, start_time=trade_start_time, end_time=trade_end_time
+            ) and trade_exchange.is_stock_tradable(
+                stock_id=stock_id, start_time=pred_start_time, end_time=pred_end_time
+            ):
                 amount_dict[stock_id] = (
-                    risk_total_value * target_weight_position[stock_id] / trade_exchange.get_close(stock_id, pred_date)
+                    risk_total_value
+                    * target_weight_position[stock_id]
+                    / trade_exchange.get_close(stock_id, start_time=pred_start_time, end_time=pred_end_time)
                 )
+                # TODO: Qlib use None to represent trading suspension.
+                #  So last close price can't be the estimated trading price.
+                # Maybe a close price with forward fill will be a better solution.
             elif stock_id in current_stock:
                 amount_dict[stock_id] = (
                     risk_total_value * target_weight_position[stock_id] / current.get_stock_price(stock_id)
@@ -166,6 +213,7 @@ class OrderGenWOInteract(OrderGenerator):
         order_list = trade_exchange.generate_order_for_target_amount_position(
             target_position=amount_dict,
             current_position=current.get_stock_amount_dict(),
-            trade_date=trade_date,
+            start_time=trade_start_time,
+            end_time=trade_end_time,
         )
         return order_list

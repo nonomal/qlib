@@ -2,14 +2,15 @@
 # Licensed under the MIT License.
 
 
-from __future__ import division
-from __future__ import print_function
+from __future__ import division, print_function
+
+import json
 
 import socketio
 
 import qlib
+
 from ..log import get_module_logger
-import pickle
 
 
 class Client:
@@ -34,7 +35,7 @@ class Client:
     def connect_server(self):
         """Connect to server."""
         try:
-            self.sio.connect("ws://" + self.server_host + ":" + str(self.server_port))
+            self.sio.connect(f"ws://{self.server_host}:{self.server_port}")
         except socketio.exceptions.ConnectionError:
             self.logger.error("Cannot connect to server - check your network or server status")
 
@@ -57,7 +58,7 @@ class Client:
         msg_proc_func : func
             the function to process the message when receiving response, should have arg `*args`.
         msg_queue: Queue
-            The queue to pass the messsage after callback.
+            The queue to pass the message after callback.
         """
         head_info = {"version": qlib.__version__}
 
@@ -95,7 +96,7 @@ class Client:
         self.logger.debug("connected")
         # The pickle is for passing some parameters with special type(such as
         # pd.Timestamp)
-        request_content = {"head": head_info, "body": pickle.dumps(request_content)}
+        request_content = {"head": head_info, "body": json.dumps(request_content, default=str)}
         self.sio.on(request_type + "_response", request_callback)
         self.logger.debug("try sending")
         self.sio.emit(request_type + "_request", request_content)

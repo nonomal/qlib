@@ -4,76 +4,21 @@
 """
 This example shows how a TrainerRM works based on TaskManager with rolling tasks.
 After training, how to collect the rolling results will be shown in task_collecting.
+Based on the ability of TaskManager, `worker` method offer a simple way for multiprocessing.
 """
 
 from pprint import pprint
 
 import fire
 import qlib
-from qlib.config import REG_CN
+from qlib.constant import REG_CN
 from qlib.workflow import R
 from qlib.workflow.task.gen import RollingGen, task_generator
-from qlib.workflow.task.manage import TaskManager
+from qlib.workflow.task.manage import TaskManager, run_task
 from qlib.workflow.task.collect import RecorderCollector
 from qlib.model.ens.group import RollingGroup
-from qlib.model.trainer import TrainerRM
-
-
-data_handler_config = {
-    "start_time": "2008-01-01",
-    "end_time": "2020-08-01",
-    "fit_start_time": "2008-01-01",
-    "fit_end_time": "2014-12-31",
-    "instruments": "csi100",
-}
-
-dataset_config = {
-    "class": "DatasetH",
-    "module_path": "qlib.data.dataset",
-    "kwargs": {
-        "handler": {
-            "class": "Alpha158",
-            "module_path": "qlib.contrib.data.handler",
-            "kwargs": data_handler_config,
-        },
-        "segments": {
-            "train": ("2008-01-01", "2014-12-31"),
-            "valid": ("2015-01-01", "2016-12-31"),
-            "test": ("2017-01-01", "2020-08-01"),
-        },
-    },
-}
-
-record_config = [
-    {
-        "class": "SignalRecord",
-        "module_path": "qlib.workflow.record_temp",
-    },
-    {
-        "class": "SigAnaRecord",
-        "module_path": "qlib.workflow.record_temp",
-    },
-]
-
-# use lgb
-task_lgb_config = {
-    "model": {
-        "class": "LGBModel",
-        "module_path": "qlib.contrib.model.gbdt",
-    },
-    "dataset": dataset_config,
-    "record": record_config,
-}
-
-# use xgboost
-task_xgboost_config = {
-    "model": {
-        "class": "XGBModel",
-        "module_path": "qlib.contrib.model.xgboost",
-    },
-    "dataset": dataset_config,
-    "record": record_config,
-}
+from qlib.model.trainer import TrainerR, TrainerRM, task_train
+from qlib.tests.config import CSI100_RECORD_LGB_TASK_CONFIG, CSI100_RECORD_XGBOOST_TASK_CONFIG
 
 
 class RollingTaskExample:
@@ -84,26 +29,33 @@ class RollingTaskExample:
         task_url="mongodb://10.0.0.4:27017/",
         task_db_name="rolling_db",
         experiment_name="rolling_exp",
-        task_pool="rolling_task",
-        task_config=[task_xgboost_config, task_lgb_config],
+        task_pool=None,  # if user want to  "rolling_task"
+        task_config=None,
         rolling_step=550,
         rolling_type=RollingGen.ROLL_SD,
     ):
         # TaskManager config
+        if task_config is None:
+            task_config = [CSI100_RECORD_XGBOOST_TASK_CONFIG, CSI100_RECORD_LGB_TASK_CONFIG]
         mongo_conf = {
             "task_url": task_url,
             "task_db_name": task_db_name,
         }
         qlib.init(provider_uri=provider_uri, region=region, mongo=mongo_conf)
         self.experiment_name = experiment_name
-        self.task_pool = task_pool
+        if task_pool is None:
+            self.trainer = TrainerR(experiment_name=self.experiment_name)
+        else:
+            self.task_pool = task_pool
+            self.trainer = TrainerRM(self.experiment_name, self.task_pool)
         self.task_config = task_config
         self.rolling_gen = RollingGen(step=rolling_step, rtype=rolling_type)
 
     # Reset all things to the first status, be careful to save important data
     def reset(self):
         print("========== reset ==========")
-        TaskManager(task_pool=self.task_pool).remove()
+        if isinstance(self.trainer, TrainerRM):
+            TaskManager(task_pool=self.task_pool).remove()
         exp = R.get_exp(experiment_name=self.experiment_name)
         for rid in exp.list_recorders():
             exp.delete_recorder(rid)
@@ -119,14 +71,19 @@ class RollingTaskExample:
 
     def task_training(self, tasks):
         print("========== task_training ==========")
-        trainer = TrainerRM(self.experiment_name, self.task_pool)
-        trainer.train(tasks)
+        self.trainer.train(tasks)
+
+    def worker(self):
+        # NOTE: this is only used for TrainerRM
+        # train tasks by other progress or machines for multiprocessing. It is same as TrainerRM.worker.
+        print("========== worker ==========")
+        run_task(task_train, self.task_pool, experiment_name=self.experiment_name)
 
     def task_collecting(self):
         print("========== task_collecting ==========")
 
         def rec_key(recorder):
-            task_config = recorder.load_object("task")
+            task_config = recorder.load_object("task", trusted=True)
             model_key = task_config["model"]["class"]
             rolling_key = task_config["dataset"]["kwargs"]["segments"]["test"]
             return model_key, rolling_key
